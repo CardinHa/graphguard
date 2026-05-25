@@ -1,0 +1,431 @@
+"""
+AST-based Python repository parser.
+
+Converts a directory of .py files into ParsedEntity and ParsedRelationship
+objects that the graph builder later consumes.
+
+Node ID format
+--------------
+  file::rel/path/to/file.py
+  func::rel/path/to/file.py::function_name
+  class::rel/path/to/file.py::ClassName
+  module::module_name          (external / third-party import)
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from graphguard.utils.config import SKIP_DIRS
+from graphguard.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParsedEntity:
+    """A code entity extracted from a Python source file."""
+    node_id: str            # globally unique identifier
+    name: str
+    entity_type: str        # "file" | "function" | "class" | "module"
+    file_path: str          # repo-relative path
+    line_number: int
+    lines_of_code: int = 0
+    num_params: int = 0
+    has_docstring: bool = False
+    complexity: int = 1     # cyclomatic complexity estimate (functions only)
+
+
+@dataclass
+class ParsedRelationship:
+    """A directed dependency between two code entities."""
+    source_id: str
+    target_id: str
+    relationship_type: str  # "imports" | "calls" | "inherits" | "contains"
+    file_path: str
+    line_number: int = 0
+
+
+@dataclass
+class ParseResult:
+    """Aggregated output from parsing an entire repository."""
+    entities: list[ParsedEntity] = field(default_factory=list)
+    relationships: list[ParsedRelationship] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    def entity_map(self) -> dict[str, ParsedEntity]:
+        return {e.node_id: e for e in self.entities}
+
+
+# ---------------------------------------------------------------------------
+# Helpers for node IDs
+# ---------------------------------------------------------------------------
+
+def _file_id(rel_path: str) -> str:
+    return f"file::{rel_path}"
+
+
+def _func_id(rel_path: str, name: str) -> str:
+    return f"func::{rel_path}::{name}"
+
+
+def _class_id(rel_path: str, name: str) -> str:
+    return f"class::{rel_path}::{name}"
+
+
+def _module_id(name: str) -> str:
+    return f"module::{name}"
+
+
+# ---------------------------------------------------------------------------
+# Cyclomatic complexity estimator
+# ---------------------------------------------------------------------------
+
+_BRANCH_NODES = (
+    ast.If, ast.For, ast.While, ast.Try,
+    ast.ExceptHandler, ast.With, ast.Assert,
+    ast.comprehension,
+)
+
+# BoolOp (and/or) adds one path per additional operand
+_BOOL_EXTRA = ast.BoolOp
+
+
+def _cyclomatic_complexity(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    """Estimate McCabe cyclomatic complexity: 1 + number of branching points."""
+    count = 1
+    for node in ast.walk(func_node):
+        if isinstance(node, _BRANCH_NODES):
+            count += 1
+        elif isinstance(node, _BOOL_EXTRA):
+            # each additional operand beyond the first adds a path
+            count += len(node.values) - 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Per-file AST visitor
+# ---------------------------------------------------------------------------
+
+class _FileVisitor(ast.NodeVisitor):
+    """Walks a single file's AST and collects entities + relationships."""
+
+    def __init__(self, rel_path: str, source_lines: list[str]) -> None:
+        self.rel_path = rel_path
+        self.source_lines = source_lines
+        self.file_id = _file_id(rel_path)
+
+        self.entities: list[ParsedEntity] = []
+        self.relationships: list[ParsedRelationship] = []
+
+        # Track names defined in this file for call resolution
+        self._defined_funcs: dict[str, str] = {}   # name -> node_id
+        self._defined_classes: dict[str, str] = {} # name -> node_id
+
+        # Import alias → module top-level name
+        self._import_map: dict[str, str] = {}
+        # Imported symbol name → source module top-level name
+        # e.g. `from enum import Enum` registers {"Enum": "enum"}
+        self._imported_names: dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
+    def _loc(self, node: ast.AST) -> int:
+        """Lines of code for a function or class body."""
+        if hasattr(node, "end_lineno") and hasattr(node, "lineno"):
+            return node.end_lineno - node.lineno + 1  # type: ignore[attr-defined]
+        return 0
+
+    def _has_docstring(self, node: ast.FunctionDef | ast.ClassDef | ast.Module) -> bool:
+        return (
+            bool(node.body)
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        )
+
+    def _add_rel(
+        self,
+        src: str,
+        tgt: str,
+        rel_type: str,
+        lineno: int = 0,
+    ) -> None:
+        if src != tgt:
+            self.relationships.append(
+                ParsedRelationship(
+                    source_id=src,
+                    target_id=tgt,
+                    relationship_type=rel_type,
+                    file_path=self.rel_path,
+                    line_number=lineno,
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # File-level entity (created once per file in the parser)
+    # ------------------------------------------------------------------
+
+    def _file_entity(self, total_lines: int) -> ParsedEntity:
+        return ParsedEntity(
+            node_id=self.file_id,
+            name=Path(self.rel_path).name,
+            entity_type="file",
+            file_path=self.rel_path,
+            line_number=1,
+            lines_of_code=total_lines,
+        )
+
+    # ------------------------------------------------------------------
+    # Import handling
+    # ------------------------------------------------------------------
+
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
+        for alias in node.names:
+            top = alias.name.split(".")[0]
+            mid = _module_id(top)
+            bound = alias.asname or alias.name
+            self._import_map[bound] = top
+            self._imported_names[bound] = top
+            self._add_rel(self.file_id, mid, "imports", node.lineno)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
+        module = node.module or ""
+        top = module.split(".")[0] if module else ""
+        if top:
+            mid = _module_id(top)
+            self._import_map[top] = top
+            self._add_rel(self.file_id, mid, "imports", node.lineno)
+            # Map each imported symbol back to its source module so that
+            # `from enum import Enum` lets us resolve a base class `Enum`.
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                self._imported_names[bound] = top
+        self.generic_visit(node)
+
+    # ------------------------------------------------------------------
+    # Function definitions
+    # ------------------------------------------------------------------
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        self._handle_func(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+        self._handle_func(node)
+
+    def _handle_func(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        fid = _func_id(self.rel_path, node.name)
+        self._defined_funcs[node.name] = fid
+
+        # Count params (exclude self/cls)
+        args = node.args
+        all_params = (
+            args.args + args.posonlyargs + args.kwonlyargs
+            + ([args.vararg] if args.vararg else [])
+            + ([args.kwarg] if args.kwarg else [])
+        )
+        non_self = [a for a in all_params if a.arg not in ("self", "cls")]
+        num_params = len(non_self)
+
+        entity = ParsedEntity(
+            node_id=fid,
+            name=node.name,
+            entity_type="function",
+            file_path=self.rel_path,
+            line_number=node.lineno,
+            lines_of_code=self._loc(node),
+            num_params=num_params,
+            has_docstring=self._has_docstring(node),
+            complexity=_cyclomatic_complexity(node),
+        )
+        self.entities.append(entity)
+
+        # file --contains--> function
+        self._add_rel(self.file_id, fid, "contains", node.lineno)
+
+        # Walk calls inside this function
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                self._handle_call(fid, child)
+
+        self.generic_visit(node)
+
+    # ------------------------------------------------------------------
+    # Class definitions
+    # ------------------------------------------------------------------
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+        cid = _class_id(self.rel_path, node.name)
+        self._defined_classes[node.name] = cid
+
+        entity = ParsedEntity(
+            node_id=cid,
+            name=node.name,
+            entity_type="class",
+            file_path=self.rel_path,
+            line_number=node.lineno,
+            lines_of_code=self._loc(node),
+            has_docstring=self._has_docstring(node),
+        )
+        self.entities.append(entity)
+
+        # file --contains--> class
+        self._add_rel(self.file_id, cid, "contains", node.lineno)
+
+        # Inheritance edges (best-effort name resolution)
+        for base in node.bases:
+            base_name = self._extract_name(base)
+            if base_name:
+                target_id = self._resolve_base(base_name)
+                self._add_rel(cid, target_id, "inherits", node.lineno)
+
+        self.generic_visit(node)
+
+    def _resolve_base(self, base_name: str) -> str:
+        """
+        Resolve a base-class name to a node ID.
+
+        Resolution order:
+          1. Class defined in this file       -> class:: node
+          2. Imported symbol (e.g. Enum)      -> module:: node of its source
+          3. Dotted name on an imported alias -> module:: node of the alias
+          4. Unknown external base            -> module:: stub (NOT a fake class)
+        """
+        # 1. Locally defined class
+        if base_name in self._defined_classes:
+            return self._defined_classes[base_name]
+        # 2. Directly imported symbol (from x import Base)
+        if base_name in self._imported_names:
+            return _module_id(self._imported_names[base_name])
+        # 3. Attribute access on an imported alias (abc.ABC -> module::abc)
+        top = base_name.split(".")[0]
+        if top in self._import_map:
+            return _module_id(self._import_map[top])
+        # 4. Unknown external base — treat as a module-level dependency
+        return _module_id(top)
+
+    # ------------------------------------------------------------------
+    # Call resolution (best-effort)
+    # ------------------------------------------------------------------
+
+    def _handle_call(self, caller_id: str, call_node: ast.Call) -> None:
+        name = self._extract_call_name(call_node)
+        if not name:
+            return
+        # Try local function first
+        if name in self._defined_funcs:
+            self._add_rel(
+                caller_id, self._defined_funcs[name], "calls", call_node.col_offset
+            )
+        elif "." in name:
+            # e.g. services.process_order — record as module-level call
+            top = name.split(".")[0]
+            if top in self._import_map:
+                mid = _module_id(self._import_map[top])
+                self._add_rel(caller_id, mid, "calls", 0)
+        # Unresolvable calls are silently dropped to keep the graph clean
+
+    def _extract_call_name(self, call: ast.Call) -> Optional[str]:
+        return self._extract_name(call.func)
+
+    def _extract_name(self, node: ast.expr) -> Optional[str]:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = self._extract_name(node.value)
+            return f"{parent}.{node.attr}" if parent else node.attr
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main parser
+# ---------------------------------------------------------------------------
+
+class PythonParser:
+    """
+    Recursively parses a Python repository into entities and relationships.
+
+    Usage
+    -----
+    >>> parser = PythonParser()
+    >>> result = parser.parse("/path/to/repo")
+    """
+
+    def __init__(self, skip_dirs: frozenset[str] | None = None) -> None:
+        self.skip_dirs = skip_dirs if skip_dirs is not None else SKIP_DIRS
+
+    def parse(self, repo_path: str | Path) -> ParseResult:
+        """Parse every .py file under repo_path and return a ParseResult."""
+        root = Path(repo_path).resolve()
+        result = ParseResult()
+
+        py_files = list(self._walk_py_files(root))
+        logger.info(f"Found {len(py_files)} Python files to parse.")
+
+        # First pass: collect all class/function definitions for cross-file resolution
+        # We do a two-pass strategy: pass 1 = register names, pass 2 = resolve calls
+        for rel_path, abs_path in py_files:
+            self._parse_file(rel_path, abs_path, result)
+
+        logger.info(
+            f"Parsed {len(result.entities)} entities, "
+            f"{len(result.relationships)} relationships, "
+            f"{len(result.errors)} errors."
+        )
+        return result
+
+    def _walk_py_files(self, root: Path) -> list[tuple[str, Path]]:
+        """Yield (rel_path, abs_path) for every .py file not under a skipped dir."""
+        files = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Prune skipped directories in-place so os.walk doesn't recurse
+            dirnames[:] = [
+                d for d in dirnames if d not in self.skip_dirs and not d.startswith(".")
+            ]
+            for fname in filenames:
+                if fname.endswith(".py"):
+                    abs_path = Path(dirpath) / fname
+                    rel_path = str(abs_path.relative_to(root)).replace("\\", "/")
+                    files.append((rel_path, abs_path))
+        return files
+
+    def _parse_file(
+        self, rel_path: str, abs_path: Path, result: ParseResult
+    ) -> None:
+        try:
+            source = abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            result.errors.append(f"Cannot read {rel_path}: {exc}")
+            return
+
+        try:
+            tree = ast.parse(source, filename=str(abs_path))
+        except SyntaxError as exc:
+            result.errors.append(f"SyntaxError in {rel_path}: {exc}")
+            return
+
+        source_lines = source.splitlines()
+        visitor = _FileVisitor(rel_path, source_lines)
+
+        # Register the file entity
+        file_entity = visitor._file_entity(len(source_lines))
+        result.entities.append(file_entity)
+
+        # Walk the AST
+        visitor.visit(tree)
+
+        result.entities.extend(visitor.entities)
+        result.relationships.extend(visitor.relationships)

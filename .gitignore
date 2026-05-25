@@ -1,0 +1,44 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+*.pyc
+
+# Top-level outputs — track only the .gitkeep placeholder
+/outputs/*
+!/outputs/.gitkeep
+
+# Regenerated demo artifacts (graphs, features, predictions, metrics, weights)
+examples/**/outputs/
+
+# Model weights
+*.pt
+*.pth
+
+# Data files (generated)
+*.graphml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Jupyter
+*.ipynb_checkpoints/

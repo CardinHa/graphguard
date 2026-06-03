@@ -3,11 +3,12 @@ GraphGuard CLI — professional command-line interface.
 
 Commands
 --------
-  graphguard analyze   <repo>   Parse repo and build dependency graph
-  graphguard train     <repo>   Full train pipeline (parse + features + GNN + baselines)
-  graphguard report    <repo>   Print risk report from existing outputs
-  graphguard dashboard [repo]   Launch Streamlit dashboard
-  graphguard api                Launch FastAPI server
+  graphguard analyze   <repo>            Parse repo and build dependency graph
+  graphguard train     <repo>            Full train pipeline (parse + features + GNN + baselines)
+  graphguard report    <repo>            Print risk report from existing outputs
+  graphguard explain   <repo> <node>     GNNExplainer attribution for a single node
+  graphguard dashboard [repo]            Launch Streamlit dashboard
+  graphguard api                         Launch FastAPI server
 
 Module-level entrypoint (for dev without installation):
   python -m graphguard.cli analyze examples/sample_project
@@ -212,6 +213,145 @@ def report(
         )
 
     console.print(risk_table)
+
+
+# ---------------------------------------------------------------------------
+# explain
+# ---------------------------------------------------------------------------
+
+@app.command()
+def explain(
+    repo_path: str = typer.Argument(..., help="Path to Python repository"),
+    node: str = typer.Argument(..., help="Node name, node_id, or substring to explain"),
+    output_dir: Optional[str] = typer.Option(None, "--output-dir", "-o"),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="Top features/neighbors to show"),
+    epochs: int = typer.Option(200, "--epochs", "-e", help="GNNExplainer optimisation steps"),
+    save: bool = typer.Option(False, "--save", help="Save explanation to explanations.json"),
+) -> None:
+    """[cyan]GNNExplainer attribution — why was this node flagged as risky?[/]
+
+    Shows the input features and graph neighbors that most influenced
+    the model's risk prediction for a specific node.
+
+    Examples
+    --------
+      graphguard explain examples/requests_live resolve_proxies
+      graphguard explain examples/requests_live utils.py --top-k 8
+    """
+    import json as _json
+
+    from rich.table import Table
+
+    from graphguard.data.dataset import CodeGraphDataset
+    from graphguard.data.git_mining import GitMiner
+    from graphguard.graph.features import FeatureExtractor
+    from graphguard.graph.graph_builder import GraphBuilder
+    from graphguard.models.explain import explain_node, load_model
+    from graphguard.parser.python_parser import PythonParser
+
+    repo = Path(repo_path)
+    if not repo.exists():
+        console.print(f"[red]Error:[/] Repository not found: {repo}")
+        raise typer.Exit(1)
+
+    out = Path(output_dir) if output_dir else repo / "outputs"
+
+    # Read the label_mode used during training so we reconstruct identical labels
+    meta_path = out / "dataset_meta.json"
+    if not meta_path.exists():
+        console.print(
+            f"[red]No training outputs at {out}.[/] Run [bold]graphguard train[/] first."
+        )
+        raise typer.Exit(1)
+
+    meta_info = _json.loads(meta_path.read_text(encoding="utf-8"))
+    label_mode = meta_info.get("label_mode", "synthetic")
+
+    console.rule("[bold cyan]GraphGuard · Explain[/]")
+    console.print(f"[dim]Reconstructing graph for '{repo_path}' (label_mode={label_mode})...[/]")
+
+    # Steps 1–5: fast rebuild (no training)
+    config = Config(label_mode=label_mode)
+
+    parser = PythonParser()
+    parse_result = parser.parse(repo)
+
+    builder = GraphBuilder()
+    G = builder.build(parse_result)
+
+    extractor = FeatureExtractor()
+    features_df = extractor.extract(G)
+
+    labels = None
+    if label_mode == "git":
+        miner = GitMiner(repo)
+        file_counts = miner.mine_bug_fix_labels()
+        if file_counts:
+            labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+
+    dataset_builder = CodeGraphDataset(config)
+    data, _ = dataset_builder.build(G, features_df, labels=labels, undirected=False)
+
+    # Load saved model weights
+    try:
+        model = load_model(out, data, config)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    # Run GNNExplainer
+    feat_names = FeatureExtractor.numeric_feature_columns()
+    available = [c for c in feat_names if c in features_df.columns]
+
+    console.print(f"[cyan]Running GNNExplainer ({epochs} epochs)...[/]")
+    try:
+        result = explain_node(
+            query=node,
+            data=data,
+            model=model,
+            features_df=features_df,
+            feature_names=available,
+            top_k=top_k,
+            explainer_epochs=epochs,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    # Display
+    risk_color = "red" if result["risk_score"] >= 0.5 else "green"
+    console.print(
+        f"\n[bold]Node:[/] {result['node_id']}"
+        f"\n[bold]Risk Score:[/] [{risk_color}]{result['risk_score']:.4f}[/{risk_color}]"
+    )
+
+    feat_table = Table(title="Top Contributing Features", style="cyan")
+    feat_table.add_column("Feature", style="bold")
+    feat_table.add_column("Attribution Weight", justify="right")
+    for item in result["feature_importance"]:
+        feat_table.add_row(item["feature"], f"{item['weight']:.4f}")
+    console.print(feat_table)
+
+    if result["influential_neighbors"]:
+        nbr_table = Table(title="Most Influential Neighbors", style="yellow")
+        nbr_table.add_column("Neighbor", style="bold")
+        nbr_table.add_column("Edge Attribution", justify="right")
+        for item in result["influential_neighbors"]:
+            nbr_table.add_row(item["node"], f"{item['weight']:.4f}")
+        console.print(nbr_table)
+    else:
+        console.print("[dim]No edges found for this node.[/]")
+
+    if save:
+        dest = out / "explanations.json"
+        existing: list[dict] = []
+        if dest.exists():
+            existing = _json.loads(dest.read_text(encoding="utf-8"))
+        # Replace any previous explanation for the same node
+        existing = [e for e in existing if e.get("node_id") != result["node_id"]]
+        existing.append(result)
+        dest.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
+        console.print(f"[green]Saved to {dest}[/]")
 
 
 # ---------------------------------------------------------------------------

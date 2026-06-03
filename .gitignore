@@ -19,6 +19,11 @@ env/
 # Regenerated demo artifacts (graphs, features, predictions, metrics, weights)
 examples/**/outputs/
 
+# Live analysis targets (cloned repos, not our source)
+examples/requests_live/
+examples/flask_live/
+examples/scikit_live/
+
 # Model weights
 *.pt
 *.pth

@@ -3,11 +3,12 @@ GraphGuard FastAPI backend.
 
 Endpoints
 ---------
-  GET  /health        Liveness check
-  POST /analyze       Parse + analyze a repo (accepts repo_path in request body)
-  GET  /graph         Return graph stats and edge/node lists from latest run
-  GET  /predictions   Return sorted node risk predictions from latest run
-  GET  /metrics       Return model comparison metrics from latest run
+  GET  /health          Liveness check
+  POST /analyze         Parse + analyze a repo (accepts repo_path in request body)
+  GET  /graph           Return graph stats and edge/node lists from latest run
+  GET  /predictions     Return sorted node risk predictions from latest run
+  GET  /metrics         Return model comparison metrics from latest run
+  POST /explain         GNNExplainer attribution for a single node
 
 Design note: This API is stateless between requests — it reads outputs written
 by the training pipeline rather than holding in-memory state, making it easy
@@ -53,6 +54,14 @@ class AnalyzeRequest(BaseModel):
     label_mode: str = "synthetic"
     model_type: str = "sage"
     epochs: int = 200
+
+
+class ExplainRequest(BaseModel):
+    repo_path: str
+    node: str
+    output_dir: Optional[str] = None
+    top_k: int = 5
+    explainer_epochs: int = 200
 
 
 class HealthResponse(BaseModel):
@@ -183,3 +192,86 @@ def get_metrics(output_dir: Optional[str] = None) -> dict[str, Any]:
 
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
     return {"models": metrics}
+
+
+@app.post("/explain")
+def explain(request: ExplainRequest) -> dict[str, Any]:
+    """
+    Run GNNExplainer for a single node and return feature + edge attribution.
+
+    Reconstructs the dependency graph from the repository (fast — no training),
+    loads the saved model weights, and returns which input features and graph
+    neighbors most influenced the risk prediction for the requested node.
+
+    The `node` field accepts:
+      - Exact node_id (e.g. "func::src/requests/utils.py::resolve_proxies")
+      - Function or class name (e.g. "resolve_proxies")
+      - Substring of a node_id (e.g. "utils.py")
+    """
+    from graphguard.data.dataset import CodeGraphDataset
+    from graphguard.data.git_mining import GitMiner
+    from graphguard.graph.features import FeatureExtractor
+    from graphguard.graph.graph_builder import GraphBuilder
+    from graphguard.models.explain import explain_node, load_model
+    from graphguard.parser.python_parser import PythonParser
+    from graphguard.utils.config import Config
+
+    repo = Path(request.repo_path)
+    if not repo.exists():
+        raise HTTPException(status_code=400, detail=f"Repository not found: {repo}")
+
+    out = _output_dir(request.output_dir)
+    meta_path = out / "dataset_meta.json"
+    if not meta_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No training outputs at {out}. Run /analyze first.",
+        )
+
+    meta_info = json.loads(meta_path.read_text(encoding="utf-8"))
+    label_mode = meta_info.get("label_mode", "synthetic")
+    config = Config(label_mode=label_mode)
+
+    try:
+        # Rebuild graph + dataset (no training — typically < 3s for small repos)
+        parser = PythonParser()
+        parse_result = parser.parse(repo)
+
+        builder = GraphBuilder()
+        G = builder.build(parse_result)
+
+        extractor = FeatureExtractor()
+        features_df = extractor.extract(G)
+
+        labels = None
+        if label_mode == "git":
+            miner = GitMiner(repo)
+            file_counts = miner.mine_bug_fix_labels()
+            if file_counts:
+                labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+
+        dataset_builder = CodeGraphDataset(config)
+        data, _ = dataset_builder.build(G, features_df, labels=labels, undirected=False)
+
+        model = load_model(out, data, config)
+
+        feat_names = FeatureExtractor.numeric_feature_columns()
+        available = [c for c in feat_names if c in features_df.columns]
+
+        result = explain_node(
+            query=request.node,
+            data=data,
+            model=model,
+            features_df=features_df,
+            feature_names=available,
+            top_k=request.top_k,
+            explainer_epochs=request.explainer_epochs,
+        )
+        return result
+
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

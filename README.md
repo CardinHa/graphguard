@@ -359,6 +359,7 @@ Base URL: `http://localhost:8000`
 | GET | `/graph` | Graph stats + sample nodes/edges |
 | GET | `/predictions?top_n=50` | Top-N risky nodes sorted by score |
 | GET | `/metrics` | GNN vs baseline comparison |
+| POST | `/explain` | GNNExplainer attribution for a single node |
 
 **Example:**
 
@@ -369,6 +370,11 @@ curl http://localhost:8000/health
 curl -X POST http://localhost:8000/analyze \
   -H "Content-Type: application/json" \
   -d '{"repo_path": "examples/sample_project", "label_mode": "synthetic"}'
+
+curl -X POST http://localhost:8000/explain \
+  -H "Content-Type: application/json" \
+  -d '{"repo_path": "examples/sample_project", "node": "buggy_function", "top_k": 5}'
+# {"node_id": "func::...", "risk_score": 0.97, "feature_importance": [...], "influential_neighbors": [...]}
 ```
 
 ---

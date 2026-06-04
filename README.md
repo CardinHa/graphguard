@@ -6,7 +6,7 @@
 [![PyTorch Geometric](https://img.shields.io/badge/PyG-2.3+-orange.svg)](https://pyg.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-65%20passing-brightgreen.svg)](tests/)
-[![CI](https://github.com/your-username/graphguard/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+[![CI](https://github.com/CardinHa/graphguard/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 
 ---
 
@@ -219,7 +219,7 @@ risk_score = 0.4 * norm(fan_in) + 0.3 * norm(betweenness) + 0.3 * norm(complexit
 ### Option 1: pip (development install)
 
 ```bash
-git clone https://github.com/your-username/graphguard
+git clone https://github.com/CardinHa/graphguard
 cd graphguard
 
 # Create a virtual environment

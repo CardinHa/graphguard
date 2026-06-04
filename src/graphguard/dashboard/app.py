@@ -321,36 +321,132 @@ with tab4:
         row = predictions[predictions["name"] == selected_name].iloc[0]
         nid = row["node_id"]
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Risk Score", f"{row['risk_score']:.4f}")
         col2.metric("Entity Type", row.get("entity_type", ""))
-        st.metric("File", row.get("file_path", ""))
+        col3.metric("Predicted Risky", "YES" if row.get("predicted_risky") else "NO")
+        st.caption(f"**Node ID:** `{nid}`")
+        st.caption(f"**File:** {row.get('file_path', '')}")
 
-        st.markdown("**Why might this node be risky?**")
+        st.divider()
 
-        if nid in features_df.index:
-            feat = features_df.loc[nid]
-            explanations = []
-            if float(feat.get("betweenness", 0)) > 0.05:
-                explanations.append("🔴 **High betweenness centrality**: many shortest paths pass through this node — it's a structural bottleneck.")
-            if float(feat.get("fan_in", 0)) > 3:
-                explanations.append(f"🔴 **High fan-in** ({int(feat.get('fan_in', 0))}): many modules depend on this node — changes here cascade widely.")
-            if float(feat.get("complexity", 1)) > 5:
-                explanations.append(f"🔴 **High complexity** ({int(feat.get('complexity', 1))}): estimated cyclomatic complexity suggests many branches.")
-            if not int(feat.get("has_docstring", 0)):
-                explanations.append("🟡 **No docstring**: undocumented code is harder to maintain correctly.")
-            if float(feat.get("lines_of_code", 0)) > 50:
-                explanations.append(f"🟡 **Large function/file** ({int(feat.get('lines_of_code', 0))} lines): larger units tend to accumulate more responsibilities.")
+        # ---- GNNExplainer attribution ----
+        st.markdown("#### GNNExplainer Attribution")
+        st.markdown(
+            "Runs GNNExplainer to learn which input **features** and graph "
+            "**neighbors** most influenced the model's prediction for this node."
+        )
 
-            if explanations:
-                for exp in explanations:
-                    st.markdown(f"- {exp}")
+        explain_btn = st.button("Run GNNExplainer", type="primary")
+
+        if explain_btn:
+            meta_path = out_dir / "dataset_meta.json"
+            if not meta_path.exists():
+                st.error("No dataset_meta.json found. Re-run the training pipeline.")
             else:
-                st.markdown("- No strong individual risk signals. The GNN may have detected a risk pattern in the neighborhood structure.")
+                import json as _json
 
-            # Show raw features
-            with st.expander("Raw feature values"):
-                numeric_cols = [c for c in features_df.columns if features_df[c].dtype in ["float64", "int64", "float32", "int32"]]
+                from graphguard.data.dataset import CodeGraphDataset
+                from graphguard.data.git_mining import GitMiner
+                from graphguard.graph.features import FeatureExtractor
+                from graphguard.graph.graph_builder import GraphBuilder
+                from graphguard.models.explain import explain_node as _explain_node
+                from graphguard.models.explain import load_model
+                from graphguard.parser.python_parser import PythonParser
+                from graphguard.utils.config import Config
+
+                meta_info = _json.loads(meta_path.read_text(encoding="utf-8"))
+                label_mode_loaded = meta_info.get("label_mode", "synthetic")
+                config = Config(label_mode=label_mode_loaded)
+
+                with st.spinner("Rebuilding graph and running GNNExplainer (this takes ~10s)..."):
+                    try:
+                        repo = Path(repo_path_input)
+                        parser = PythonParser()
+                        parse_result = parser.parse(repo)
+                        builder = GraphBuilder()
+                        G = builder.build(parse_result)
+                        extractor = FeatureExtractor()
+                        feat_df = extractor.extract(G)
+
+                        labels = None
+                        if label_mode_loaded == "git":
+                            miner = GitMiner(repo)
+                            file_counts = miner.mine_bug_fix_labels()
+                            if file_counts:
+                                labels = miner.file_labels_to_node_labels(
+                                    file_counts, list(G.nodes())
+                                )
+
+                        dataset_builder = CodeGraphDataset(config)
+                        data, _ = dataset_builder.build(
+                            G, feat_df, labels=labels, undirected=False
+                        )
+                        model = load_model(out_dir, data, config)
+
+                        feat_names = FeatureExtractor.numeric_feature_columns()
+                        available = [c for c in feat_names if c in feat_df.columns]
+
+                        result = _explain_node(
+                            query=nid,
+                            data=data,
+                            model=model,
+                            features_df=feat_df,
+                            feature_names=available,
+                            top_k=8,
+                            explainer_epochs=200,
+                        )
+                        st.session_state["explain_result"] = result
+
+                    except Exception as exc:
+                        st.error(f"GNNExplainer failed: {exc}")
+
+        if "explain_result" in st.session_state:
+            result = st.session_state["explain_result"]
+            if result.get("node_id") == nid:
+                feat_imp = result.get("feature_importance", [])
+                nbr_imp = result.get("influential_neighbors", [])
+
+                ecol1, ecol2 = st.columns(2)
+
+                with ecol1:
+                    st.markdown("**Top Contributing Features**")
+                    if feat_imp:
+                        import plotly.graph_objects as go
+                        fig = go.Figure(go.Bar(
+                            x=[f["weight"] for f in feat_imp],
+                            y=[f["feature"] for f in feat_imp],
+                            orientation="h",
+                            marker_color="#e74c3c",
+                        ))
+                        fig.update_layout(
+                            height=300,
+                            margin=dict(l=0, r=0, t=0, b=0),
+                            xaxis_title="Attribution Weight",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            font=dict(color="white"),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                with ecol2:
+                    st.markdown("**Most Influential Neighbors**")
+                    if nbr_imp:
+                        nbr_df = pd.DataFrame(nbr_imp)
+                        st.dataframe(nbr_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No edges found for this node.")
+
+        st.divider()
+
+        # ---- Raw feature values ----
+        with st.expander("Raw feature values"):
+            if nid in features_df.index:
+                feat = features_df.loc[nid]
+                numeric_cols = [
+                    c for c in features_df.columns
+                    if features_df[c].dtype in ["float64", "int64", "float32", "int32"]
+                ]
                 if numeric_cols:
                     st.dataframe(feat[numeric_cols].to_frame(name="value").T)
     else:

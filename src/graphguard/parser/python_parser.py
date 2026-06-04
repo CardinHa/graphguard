@@ -60,6 +60,8 @@ class ParseResult:
     entities: list[ParsedEntity] = field(default_factory=list)
     relationships: list[ParsedRelationship] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # (caller_id, symbol_name, full_module, lineno) — resolved in a second pass
+    pending_calls: list[tuple[str, str, str, int]] = field(default_factory=list)
 
     def entity_map(self) -> dict[str, ParsedEntity]:
         return {e.node_id: e for e in self.entities}
@@ -83,6 +85,55 @@ def _class_id(rel_path: str, name: str) -> str:
 
 def _module_id(name: str) -> str:
     return f"module::{name}"
+
+
+def _path_to_module(rel_path: str) -> str:
+    """Convert a repo-relative file path to a dotted module name.
+
+    Examples
+    --------
+    src/requests/utils.py  ->  requests.utils
+    requests/__init__.py   ->  requests
+    mypackage/core.py      ->  mypackage.core
+    """
+    p = Path(rel_path).with_suffix("")
+    parts = list(p.parts)
+    if parts and parts[0] in ("src", "lib", "source"):
+        parts = parts[1:]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts) if parts else ""
+
+
+def _resolve_relative_module(
+    rel_path: str, module: Optional[str], level: int
+) -> str:
+    """Resolve a relative import to an absolute dotted module name.
+
+    Parameters
+    ----------
+    rel_path : repo-relative path of the file containing the import
+    module   : the ``from X`` part after stripping dots (None for ``from . import Y``)
+    level    : number of leading dots (1 = current package, 2 = parent, ...)
+
+    Examples (file = src/requests/auth.py)
+    ----------------------------------------
+    from . import utils        -> requests.utils   (level=1, module=None, name="utils")
+    from .utils import func    -> requests.utils   (level=1, module="utils")
+    from .. import core        -> core             (level=2, module="core")
+    """
+    p = Path(rel_path).with_suffix("")
+    parts = list(p.parts)
+    if parts and parts[0] in ("src", "lib", "source"):
+        parts = parts[1:]
+    # Strip the filename (including __init__) — both regular modules and package
+    # __init__.py files live in the same directory, so both strip the last part.
+    pkg_parts = list(parts[:-1])
+    up = level - 1
+    if up > 0:
+        pkg_parts = pkg_parts[:-up] if len(pkg_parts) > up else []
+    base = ".".join(pkg_parts)
+    return f"{base}.{module}" if module else base
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +181,15 @@ class _FileVisitor(ast.NodeVisitor):
         self._defined_funcs: dict[str, str] = {}   # name -> node_id
         self._defined_classes: dict[str, str] = {} # name -> node_id
 
-        # Import alias → module top-level name
+        # Import alias → top-level module name (for module-edge fallback)
         self._import_map: dict[str, str] = {}
-        # Imported symbol name → source module top-level name
-        # e.g. `from enum import Enum` registers {"Enum": "enum"}
+        # Imported symbol/alias → full dotted module path
+        # e.g. `from requests.utils import func`  -> {"func": "requests.utils"}
+        # e.g. `from . import utils` in pkg/auth.py -> {"utils": "pkg.utils"}
+        # e.g. `from enum import Enum`              -> {"Enum": "enum"}
         self._imported_names: dict[str, str] = {}
+        # Calls to imported symbols that need cross-file resolution
+        self._pending_calls: list[tuple[str, str, str, int]] = []
 
     # ------------------------------------------------------------------
     # Utilities
@@ -196,22 +251,41 @@ class _FileVisitor(ast.NodeVisitor):
             mid = _module_id(top)
             bound = alias.asname or alias.name
             self._import_map[bound] = top
-            self._imported_names[bound] = top
+            self._imported_names[bound] = alias.name  # full module for call resolution
             self._add_rel(self.file_id, mid, "imports", node.lineno)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
         module = node.module or ""
-        top = module.split(".")[0] if module else ""
+
+        if node.level > 0:
+            # Relative import — resolve to an absolute module name
+            full_module = _resolve_relative_module(
+                self.rel_path, module or None, node.level
+            )
+            top = full_module.split(".")[0] if full_module else ""
+        else:
+            full_module = module
+            top = module.split(".")[0] if module else ""
+
         if top:
             mid = _module_id(top)
             self._import_map[top] = top
             self._add_rel(self.file_id, mid, "imports", node.lineno)
-            # Map each imported symbol back to its source module so that
-            # `from enum import Enum` lets us resolve a base class `Enum`.
-            for alias in node.names:
-                bound = alias.asname or alias.name
-                self._imported_names[bound] = top
+
+        for alias in node.names:
+            bound = alias.asname or alias.name
+            # `from . import utils` — each imported name is itself a submodule
+            if node.level > 0 and not module:
+                sub_full = f"{full_module}.{alias.name}" if full_module else alias.name
+            else:
+                sub_full = full_module
+
+            # _import_map: used for module-level edge fallback
+            self._import_map[bound] = top or bound
+            # _imported_names: full module path, drives call + inheritance resolution
+            self._imported_names[bound] = sub_full
+
         self.generic_visit(node)
 
     # ------------------------------------------------------------------
@@ -300,16 +374,19 @@ class _FileVisitor(ast.NodeVisitor):
 
         Resolution order:
           1. Class defined in this file       -> class:: node
-          2. Imported symbol (e.g. Enum)      -> module:: node of its source
+          2. Imported symbol (e.g. Enum)      -> module:: node of its top-level source
           3. Dotted name on an imported alias -> module:: node of the alias
           4. Unknown external base            -> module:: stub (NOT a fake class)
         """
         # 1. Locally defined class
         if base_name in self._defined_classes:
             return self._defined_classes[base_name]
-        # 2. Directly imported symbol (from x import Base)
+        # 2. Directly imported symbol — _imported_names now stores full module, but
+        #    module nodes are keyed by top-level only (module::os, module::enum, ...)
         if base_name in self._imported_names:
-            return _module_id(self._imported_names[base_name])
+            full = self._imported_names[base_name]
+            top = full.split(".")[0] if full else base_name
+            return _module_id(top)
         # 3. Attribute access on an imported alias (abc.ABC -> module::abc)
         top = base_name.split(".")[0]
         if top in self._import_map:
@@ -325,18 +402,32 @@ class _FileVisitor(ast.NodeVisitor):
         name = self._extract_call_name(call_node)
         if not name:
             return
-        # Try local function first
+        lineno = getattr(call_node, "lineno", 0)
+
+        # 1. Locally defined function — same-file edge, immediate resolution
         if name in self._defined_funcs:
-            self._add_rel(
-                caller_id, self._defined_funcs[name], "calls", call_node.col_offset
-            )
-        elif "." in name:
-            # e.g. services.process_order — record as module-level call
-            top = name.split(".")[0]
-            if top in self._import_map:
-                mid = _module_id(self._import_map[top])
+            self._add_rel(caller_id, self._defined_funcs[name], "calls", lineno)
+            return
+
+        # 2. Directly imported symbol: `from requests.utils import func; func()`
+        if name in self._imported_names:
+            full_mod = self._imported_names[name]
+            if full_mod:
+                self._pending_calls.append((caller_id, name, full_mod, lineno))
+            return
+
+        # 3. Attribute call on an imported alias: `utils.func()` or `mod.Class()`
+        if "." in name:
+            alias, _, func_name = name.partition(".")
+            if alias in self._imported_names:
+                full_mod = self._imported_names[alias]
+                if full_mod:
+                    self._pending_calls.append((caller_id, func_name, full_mod, lineno))
+            elif alias in self._import_map:
+                # Fall back to a module-level edge when cross-file resolution isn't possible
+                mid = _module_id(self._import_map[alias])
                 self._add_rel(caller_id, mid, "calls", 0)
-        # Unresolvable calls are silently dropped to keep the graph clean
+        # Truly unresolvable calls (builtins, locals via variables, etc.) are dropped
 
     def _extract_call_name(self, call: ast.Call) -> Optional[str]:
         return self._extract_name(call.func)
@@ -380,12 +471,66 @@ class PythonParser:
         for rel_path, abs_path in py_files:
             self._parse_file(rel_path, abs_path, result)
 
+        self._resolve_cross_file_calls(result)
+
         logger.info(
             f"Parsed {len(result.entities)} entities, "
             f"{len(result.relationships)} relationships, "
             f"{len(result.errors)} errors."
         )
         return result
+
+    def _resolve_cross_file_calls(self, result: ParseResult) -> None:
+        """
+        Second pass: resolve cross-file calls collected during AST walking.
+
+        Builds two indices over the fully-parsed entity set:
+          module_name -> file_path        (for resolving the import target file)
+          (file_path, symbol_name) -> id  (for finding the exact entity)
+
+        Only owned code is resolved — pending calls targeting external libraries
+        simply produce no match and are silently dropped.
+        """
+        if not result.pending_calls:
+            return
+
+        # module dotted name -> repo-relative file path
+        module_to_path: dict[str, str] = {}
+        for entity in result.entities:
+            if entity.entity_type == "file":
+                mod = _path_to_module(entity.file_path)
+                if mod:
+                    module_to_path[mod] = entity.file_path
+
+        # (file_path, symbol_name) -> entity_id  (functions + classes)
+        sym_index: dict[tuple[str, str], str] = {}
+        for entity in result.entities:
+            if entity.entity_type in ("function", "class"):
+                sym_index[(entity.file_path, entity.name)] = entity.node_id
+
+        resolved = 0
+        for caller_id, sym_name, full_module, lineno in result.pending_calls:
+            file_path = module_to_path.get(full_module)
+            if not file_path:
+                continue
+            target_id = sym_index.get((file_path, sym_name))
+            if target_id and target_id != caller_id:
+                result.relationships.append(
+                    ParsedRelationship(
+                        source_id=caller_id,
+                        target_id=target_id,
+                        relationship_type="calls",
+                        file_path="",
+                        line_number=lineno,
+                    )
+                )
+                resolved += 1
+
+        logger.info(
+            f"Cross-file calls: {resolved} resolved "
+            f"({len(result.pending_calls)} pending, "
+            f"{len(result.pending_calls) - resolved} unresolved external/builtin)."
+        )
 
     def _walk_py_files(self, root: Path) -> list[tuple[str, Path]]:
         """Yield (rel_path, abs_path) for every .py file not under a skipped dir."""
@@ -429,3 +574,4 @@ class PythonParser:
 
         result.entities.extend(visitor.entities)
         result.relationships.extend(visitor.relationships)
+        result.pending_calls.extend(visitor._pending_calls)

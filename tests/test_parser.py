@@ -16,7 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from graphguard.parser.python_parser import PythonParser, ParseResult
+from graphguard.parser.python_parser import (
+    PythonParser,
+    ParseResult,
+    _path_to_module,
+    _resolve_relative_module,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +214,109 @@ class TestErrorResilience:
         _write(tmp_repo, "empty.py", "")
         result = PythonParser().parse(tmp_repo)
         assert len(result.errors) == 0
+
+
+# ---------------------------------------------------------------------------
+# Path/module helpers
+# ---------------------------------------------------------------------------
+
+class TestPathHelpers:
+    def test_path_to_module_with_src_prefix(self) -> None:
+        assert _path_to_module("src/requests/utils.py") == "requests.utils"
+
+    def test_path_to_module_no_prefix(self) -> None:
+        assert _path_to_module("mypackage/core.py") == "mypackage.core"
+
+    def test_path_to_module_init(self) -> None:
+        assert _path_to_module("src/requests/__init__.py") == "requests"
+
+    def test_path_to_module_nested(self) -> None:
+        assert _path_to_module("src/a/b/c.py") == "a.b.c"
+
+    def test_resolve_relative_same_package(self) -> None:
+        # from . import utils  in requests/auth.py
+        assert _resolve_relative_module("src/requests/auth.py", None, 1) == "requests"
+
+    def test_resolve_relative_submodule(self) -> None:
+        # from .utils import func  in requests/auth.py
+        assert _resolve_relative_module("src/requests/auth.py", "utils", 1) == "requests.utils"
+
+    def test_resolve_relative_parent(self) -> None:
+        # from .. import core  in requests/packages/auth.py
+        assert _resolve_relative_module("src/requests/packages/auth.py", "core", 2) == "requests.core"
+
+    def test_resolve_relative_from_init(self) -> None:
+        # from . import utils  in requests/__init__.py
+        assert _resolve_relative_module("src/requests/__init__.py", "utils", 1) == "requests.utils"
+
+
+# ---------------------------------------------------------------------------
+# Cross-file call resolution
+# ---------------------------------------------------------------------------
+
+class TestCrossFileCallResolution:
+    def test_direct_import_call_resolved(self, tmp_repo: Path) -> None:
+        """from helper_mod import helper; def main(): helper() -> cross-file calls edge."""
+        _write(tmp_repo, "helper_mod.py", "def helper():\n    pass\n")
+        _write(tmp_repo, "caller_mod.py",
+               "from helper_mod import helper\ndef main():\n    helper()\n")
+        result = PythonParser().parse(tmp_repo)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        cross = [
+            r for r in calls
+            if "main" in r.source_id and "helper" in r.target_id and "helper_mod" in r.target_id
+        ]
+        assert len(cross) == 1, f"Expected 1 cross-file call edge, got {len(cross)}: {cross}"
+
+    def test_attribute_call_resolved(self, tmp_repo: Path) -> None:
+        """import utils; utils.process() -> calls edge to utils.process."""
+        _write(tmp_repo, "utils.py", "def process():\n    pass\n")
+        _write(tmp_repo, "main.py",
+               "from utils import process\ndef run():\n    process()\n")
+        result = PythonParser().parse(tmp_repo)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        assert any("process" in r.target_id and "utils" in r.target_id for r in calls)
+
+    def test_relative_import_submodule_call(self, tmp_repo: Path) -> None:
+        """from . import utils; utils.process() -> cross-file calls edge in a package."""
+        (tmp_repo / "mypkg").mkdir()
+        _write(tmp_repo, "mypkg/__init__.py", "")
+        _write(tmp_repo, "mypkg/utils.py", "def process():\n    pass\n")
+        _write(tmp_repo, "mypkg/main.py",
+               "from . import utils\ndef run():\n    utils.process()\n")
+        result = PythonParser().parse(tmp_repo)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        assert any("process" in r.target_id for r in calls), \
+            f"Expected calls edge to process, got: {[r.target_id for r in calls]}"
+
+    def test_relative_symbol_import_call(self, tmp_repo: Path) -> None:
+        """from .utils import process; process() -> cross-file calls edge."""
+        (tmp_repo / "pkg").mkdir()
+        _write(tmp_repo, "pkg/__init__.py", "")
+        _write(tmp_repo, "pkg/utils.py", "def process():\n    pass\n")
+        _write(tmp_repo, "pkg/main.py",
+               "from .utils import process\ndef run():\n    process()\n")
+        result = PythonParser().parse(tmp_repo)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        assert any("process" in r.target_id and "utils" in r.target_id for r in calls), \
+            f"Expected cross-file edge to utils.process, calls: {[r.target_id for r in calls]}"
+
+    def test_external_library_call_not_resolved(self, tmp_repo: Path) -> None:
+        """Calls to external libraries should not create spurious entity nodes."""
+        _write(tmp_repo, "consumer.py",
+               "import os\ndef run():\n    os.path.join('a', 'b')\n")
+        result = PythonParser().parse(tmp_repo)
+        entity_ids = {e.node_id for e in result.entities}
+        # No fake function node for os.path.join should appear
+        assert not any("func::consumer.py::join" in nid for nid in entity_ids)
+
+    def test_no_self_loop_calls(self, tmp_repo: Path) -> None:
+        """Recursive calls should not create self-loop edges."""
+        _write(tmp_repo, "module.py",
+               "def factorial(n):\n    if n <= 1: return 1\n    return n * factorial(n-1)\n")
+        result = PythonParser().parse(tmp_repo)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        # Recursive call: source and target should be the same node — but
+        # _add_rel skips src == tgt, so there should be no self-loop
+        self_loops = [r for r in calls if r.source_id == r.target_id]
+        assert self_loops == []

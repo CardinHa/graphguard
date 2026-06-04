@@ -37,3 +37,4 @@ jobs:
           python -m graphguard.cli analyze examples/sample_project
           python -m graphguard.cli train examples/sample_project --epochs 50
           python -m graphguard.cli report examples/sample_project --top-n 5
+          python -m graphguard.cli explain examples/sample_project process_order_data --epochs 50

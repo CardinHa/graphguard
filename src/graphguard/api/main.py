@@ -26,6 +26,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from graphguard.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 app = FastAPI(
     title="GraphGuard API",
     description="GNN-Based Code Dependency Risk Analyzer",
@@ -209,7 +213,7 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
       - Substring of a node_id (e.g. "utils.py")
     """
     from graphguard.data.dataset import CodeGraphDataset
-    from graphguard.data.git_mining import GitMiner
+    from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
     from graphguard.graph.features import FeatureExtractor
     from graphguard.graph.graph_builder import GraphBuilder
     from graphguard.models.explain import explain_node, load_model
@@ -248,7 +252,11 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
             miner = GitMiner(repo)
             file_counts = miner.mine_bug_fix_labels()
             if file_counts:
-                labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+                try:
+                    labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+                except GitLabelPathMismatchError as exc:
+                    logger.error(str(exc))
+                    labels = None
 
         dataset_builder = CodeGraphDataset(config)
         data, _ = dataset_builder.build(G, features_df, labels=labels, undirected=False)

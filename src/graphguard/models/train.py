@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch_geometric.data import Data
 
 from graphguard.data.dataset import CodeGraphDataset
-from graphguard.data.git_mining import GitMiner
+from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
 from graphguard.graph.features import FeatureExtractor
 from graphguard.graph.graph_builder import GraphBuilder
 from graphguard.models.baselines import BaselineModels
@@ -198,11 +198,19 @@ def run_full_pipeline(
         miner = GitMiner(repo_path)
         file_counts = miner.mine_bug_fix_labels()
         if file_counts:
-            labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
-            console.print(
-                f"[green]Git labels: {sum(labels.values())} risky / "
-                f"{len(labels)} total nodes[/]"
-            )
+            try:
+                labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+                console.print(
+                    f"[green]Git labels: {sum(labels.values())} risky / "
+                    f"{len(labels)} total nodes[/]"
+                )
+            except GitLabelPathMismatchError as exc:
+                console.print(f"[bold red]{exc}[/]")
+                console.print(
+                    "[yellow]Falling back to synthetic labels due to the path "
+                    "mismatch above.[/]"
+                )
+                labels = None
         else:
             console.print("[yellow]No git history found — falling back to synthetic labels.[/]")
 

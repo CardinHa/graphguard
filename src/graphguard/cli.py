@@ -243,7 +243,7 @@ def explain(
     from rich.table import Table
 
     from graphguard.data.dataset import CodeGraphDataset
-    from graphguard.data.git_mining import GitMiner
+    from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
     from graphguard.graph.features import FeatureExtractor
     from graphguard.graph.graph_builder import GraphBuilder
     from graphguard.models.explain import explain_node, load_model
@@ -287,7 +287,12 @@ def explain(
         miner = GitMiner(repo)
         file_counts = miner.mine_bug_fix_labels()
         if file_counts:
-            labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+            try:
+                labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+            except GitLabelPathMismatchError as exc:
+                console.print(f"[bold red]{exc}[/]")
+                console.print("[yellow]Falling back to synthetic labels.[/]")
+                labels = None
 
     dataset_builder = CodeGraphDataset(config)
     data, _ = dataset_builder.build(G, features_df, labels=labels, undirected=False)

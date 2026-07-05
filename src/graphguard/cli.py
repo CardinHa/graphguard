@@ -270,8 +270,20 @@ def explain(
     console.rule("[bold cyan]GraphGuard · Explain[/]")
     console.print(f"[dim]Reconstructing graph for '{repo_path}' (label_mode={label_mode})...[/]")
 
-    # Steps 1–5: fast rebuild (no training)
-    config = Config(label_mode=label_mode)
+    # Steps 1–5: fast rebuild (no training). Reuse the model hyperparameters
+    # persisted at train time so the reconstructed architecture matches the
+    # saved state_dict — otherwise a non-default hidden_dim/num_layers/
+    # model_type would crash on load.
+    default_mc = ModelConfig()
+    config = Config(
+        label_mode=label_mode,
+        model=ModelConfig(
+            model_type=meta_info.get("model_type", default_mc.model_type),
+            hidden_dim=meta_info.get("hidden_dim", default_mc.hidden_dim),
+            num_layers=meta_info.get("num_layers", default_mc.num_layers),
+            dropout=meta_info.get("dropout", default_mc.dropout),
+        ),
+    )
 
     parser = PythonParser()
     parse_result = parser.parse(repo)

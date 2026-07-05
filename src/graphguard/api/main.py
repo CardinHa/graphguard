@@ -218,7 +218,7 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
     from graphguard.graph.graph_builder import GraphBuilder
     from graphguard.models.explain import explain_node, load_model
     from graphguard.parser.python_parser import PythonParser
-    from graphguard.utils.config import Config
+    from graphguard.utils.config import Config, ModelConfig
 
     repo = Path(request.repo_path)
     if not repo.exists():
@@ -234,7 +234,18 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
 
     meta_info = json.loads(meta_path.read_text(encoding="utf-8"))
     label_mode = meta_info.get("label_mode", "synthetic")
-    config = Config(label_mode=label_mode)
+    # Reuse the model hyperparameters persisted at train time so the
+    # reconstructed architecture matches the saved state_dict.
+    default_mc = ModelConfig()
+    config = Config(
+        label_mode=label_mode,
+        model=ModelConfig(
+            model_type=meta_info.get("model_type", default_mc.model_type),
+            hidden_dim=meta_info.get("hidden_dim", default_mc.hidden_dim),
+            num_layers=meta_info.get("num_layers", default_mc.num_layers),
+            dropout=meta_info.get("dropout", default_mc.dropout),
+        ),
+    )
 
     try:
         # Rebuild graph + dataset (no training — typically < 3s for small repos)

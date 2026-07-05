@@ -157,6 +157,35 @@ class TestFileGroupedSplit:
         assert meta.val_size / n_scorable == pytest.approx(0.15, abs=0.1)
 
 
+class TestModelConfigPersistence:
+    """dataset_meta.json must carry the model hyperparameters used for a
+    run, so `graphguard explain` / POST /explain can reconstruct an
+    architecture matching the saved state_dict instead of crashing on a
+    shape mismatch after non-default training."""
+
+    def test_metadata_persists_model_hyperparameters(self) -> None:
+        from graphguard.utils.config import Config, ModelConfig
+
+        G = _toy_graph_with_module()
+        df = FeatureExtractor().extract(G)
+        config = Config(
+            model=ModelConfig(model_type="gcn", hidden_dim=32, num_layers=3, dropout=0.5)
+        )
+        builder = CodeGraphDataset(config)
+        _, meta = builder.build(G, df)
+
+        assert meta.model_type == "gcn"
+        assert meta.hidden_dim == 32
+        assert meta.num_layers == 3
+        assert meta.dropout == 0.5
+
+        as_dict = meta.to_dict()
+        assert as_dict["model_type"] == "gcn"
+        assert as_dict["hidden_dim"] == 32
+        assert as_dict["num_layers"] == 3
+        assert as_dict["dropout"] == 0.5
+
+
 class TestDataShape:
     def test_edge_index_shape(self, builder: CodeGraphDataset) -> None:
         G = _toy_graph_with_module()

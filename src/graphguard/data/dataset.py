@@ -52,7 +52,15 @@ _SYNTHETIC_WARNING = (
 
 @dataclass
 class DatasetMetadata:
-    """Human-readable stats about the constructed dataset."""
+    """Human-readable stats about the constructed dataset.
+
+    Also carries the model hyperparameters used for this run
+    (model_type/hidden_dim/num_layers/dropout). ``graphguard explain`` and
+    POST /explain reconstruct the model from saved weights without
+    retraining, so they need these values to build an architecture that
+    matches the checkpoint — otherwise state_dict shapes mismatch whenever
+    training used non-default hyperparameters.
+    """
     num_nodes: int
     num_edges: int
     num_features: int
@@ -62,6 +70,10 @@ class DatasetMetadata:
     train_size: int
     val_size: int
     test_size: int
+    model_type: str = "sage"
+    hidden_dim: int = 64
+    num_layers: int = 2
+    dropout: float = 0.3
 
     def to_dict(self) -> dict:
         return self.__dict__
@@ -167,6 +179,10 @@ class CodeGraphDataset:
             train_size=int(train_mask.sum().item()),
             val_size=int(val_mask.sum().item()),
             test_size=int(test_mask.sum().item()),
+            model_type=self.config.model.model_type,
+            hidden_dim=self.config.model.hidden_dim,
+            num_layers=self.config.model.num_layers,
+            dropout=self.config.model.dropout,
         )
         pct = (meta.num_positive / n_scorable * 100) if n_scorable else 0.0
         logger.info(

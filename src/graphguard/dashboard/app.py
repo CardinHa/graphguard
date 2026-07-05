@@ -353,11 +353,22 @@ with tab4:
                 from graphguard.models.explain import explain_node as _explain_node
                 from graphguard.models.explain import load_model
                 from graphguard.parser.python_parser import PythonParser
-                from graphguard.utils.config import Config
+                from graphguard.utils.config import Config, ModelConfig
 
                 meta_info = _json.loads(meta_path.read_text(encoding="utf-8"))
                 label_mode_loaded = meta_info.get("label_mode", "synthetic")
-                config = Config(label_mode=label_mode_loaded)
+                # Reuse the model hyperparameters persisted at train time so
+                # the reconstructed architecture matches the saved state_dict.
+                _default_mc = ModelConfig()
+                config = Config(
+                    label_mode=label_mode_loaded,
+                    model=ModelConfig(
+                        model_type=meta_info.get("model_type", _default_mc.model_type),
+                        hidden_dim=meta_info.get("hidden_dim", _default_mc.hidden_dim),
+                        num_layers=meta_info.get("num_layers", _default_mc.num_layers),
+                        dropout=meta_info.get("dropout", _default_mc.dropout),
+                    ),
+                )
 
                 with st.spinner("Rebuilding graph and running GNNExplainer (this takes ~10s)..."):
                     try:

@@ -60,8 +60,11 @@ class ParseResult:
     entities: list[ParsedEntity] = field(default_factory=list)
     relationships: list[ParsedRelationship] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    # (caller_id, symbol_name, full_module, lineno) — resolved in a second pass
-    pending_calls: list[tuple[str, str, str, int]] = field(default_factory=list)
+    # (caller_id, symbol_name, full_module, lineno, submodule_hint) — resolved
+    # in a second pass. submodule_hint is a candidate dotted module path to
+    # try before full_module, used when the imported name might itself be a
+    # submodule (e.g. `from pkg import submodule; submodule.func()`).
+    pending_calls: list[tuple[str, str, str, int, str]] = field(default_factory=list)
 
     def entity_map(self) -> dict[str, ParsedEntity]:
         return {e.node_id: e for e in self.entities}
@@ -150,6 +153,33 @@ _BRANCH_NODES = (
 _BOOL_EXTRA = ast.BoolOp
 
 
+_NESTED_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _own_calls(node: ast.AST) -> list[ast.Call]:
+    """
+    Return every ``ast.Call`` that belongs to ``node`` itself, skipping calls
+    that live inside a nested function/coroutine definition.
+
+    Plain ``ast.walk(node)`` descends into nested ``def``s too, so a call
+    inside an inner function would be attributed to *both* the inner
+    function and its outer enclosing function — double counting the same
+    call as two separate edges. Stopping the walk at nested function
+    boundaries (their calls are collected separately, when the visitor
+    processes that nested function) fixes the double count while still
+    picking up calls nested inside non-function constructs (if/for/with/
+    lambda/comprehensions/nested calls in arguments, etc.).
+    """
+    calls: list[ast.Call] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _NESTED_SCOPE_NODES):
+            continue
+        if isinstance(child, ast.Call):
+            calls.append(child)
+        calls.extend(_own_calls(child))
+    return calls
+
+
 def _cyclomatic_complexity(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     """Estimate McCabe cyclomatic complexity: 1 + number of branching points."""
     count = 1
@@ -188,8 +218,19 @@ class _FileVisitor(ast.NodeVisitor):
         # e.g. `from . import utils` in pkg/auth.py -> {"utils": "pkg.utils"}
         # e.g. `from enum import Enum`              -> {"Enum": "enum"}
         self._imported_names: dict[str, str] = {}
+        # Bound name → candidate dotted path if the imported name is itself
+        # a submodule, e.g. `from pkg import submodule` -> {"submodule": "pkg.submodule"}.
+        # Used to disambiguate attribute calls like `submodule.func()`, which
+        # must resolve against pkg/submodule.py, not pkg/__init__.py.
+        self._submodule_hints: dict[str, str] = {}
         # Calls to imported symbols that need cross-file resolution
-        self._pending_calls: list[tuple[str, str, str, int]] = []
+        self._pending_calls: list[tuple[str, str, str, int, str]] = []
+        # Same-file calls to names not yet defined at the point of the call —
+        # may be forward references to a function defined later in this file.
+        # Resolved once the whole file has been walked (see
+        # _resolve_pending_same_file_calls), making this a genuine two-pass
+        # per-file resolution instead of definition-order-dependent.
+        self._pending_same_file_calls: list[tuple[str, str, int]] = []
 
     # ------------------------------------------------------------------
     # Utilities
@@ -249,7 +290,10 @@ class _FileVisitor(ast.NodeVisitor):
         for alias in node.names:
             top = alias.name.split(".")[0]
             mid = _module_id(top)
-            bound = alias.asname or alias.name
+            # `import a.b` binds the name `a` in the namespace, not the
+            # literal string "a.b" — code refers to it as `a.b.func()`.
+            # Only an explicit `as` alias binds the dotted string verbatim.
+            bound = alias.asname if alias.asname else top
             self._import_map[bound] = top
             self._imported_names[bound] = alias.name  # full module for call resolution
             self._add_rel(self.file_id, mid, "imports", node.lineno)
@@ -285,6 +329,16 @@ class _FileVisitor(ast.NodeVisitor):
             self._import_map[bound] = top or bound
             # _imported_names: full module path, drives call + inheritance resolution
             self._imported_names[bound] = sub_full
+            # _submodule_hints: `from pkg import name` is ambiguous — `name`
+            # may be a symbol defined in `pkg`, or itself a submodule
+            # (`pkg/name.py`). Record the submodule candidate so cross-file
+            # resolution can try it first for attribute calls like
+            # `name.func()`, instead of always assuming `name` is a symbol
+            # inside `full_module` (which looks up the wrong file when
+            # `name` is really a submodule).
+            self._submodule_hints[bound] = (
+                f"{full_module}.{alias.name}" if full_module else alias.name
+            )
 
         self.generic_visit(node)
 
@@ -330,10 +384,11 @@ class _FileVisitor(ast.NodeVisitor):
         # file --contains--> function
         self._add_rel(self.file_id, fid, "contains", node.lineno)
 
-        # Walk calls inside this function
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call):
-                self._handle_call(fid, child)
+        # Walk calls that belong to this function only — not to any nested
+        # function, so a call inside a nested `def` is attributed solely to
+        # that nested function, not double-counted against the outer one too.
+        for child in _own_calls(node):
+            self._handle_call(fid, child)
 
         self.generic_visit(node)
 
@@ -413,21 +468,55 @@ class _FileVisitor(ast.NodeVisitor):
         if name in self._imported_names:
             full_mod = self._imported_names[name]
             if full_mod:
-                self._pending_calls.append((caller_id, name, full_mod, lineno))
+                self._pending_calls.append((caller_id, name, full_mod, lineno, ""))
             return
 
-        # 3. Attribute call on an imported alias: `utils.func()` or `mod.Class()`
+        # 3. Attribute call on an imported alias/module: `utils.func()`,
+        #    `mod.Class()`, or `a.b.func()` after `import a.b`.
         if "." in name:
-            alias, _, func_name = name.partition(".")
-            if alias in self._imported_names:
-                full_mod = self._imported_names[alias]
-                if full_mod:
-                    self._pending_calls.append((caller_id, func_name, full_mod, lineno))
-            elif alias in self._import_map:
+            prefix, _, func_name = name.rpartition(".")
+            root = prefix.split(".", 1)[0]
+
+            full_mod: Optional[str] = None
+            hint = ""
+            if prefix in self._imported_names:
+                # Single-level attribute call, e.g. `utils.func()`.
+                full_mod = self._imported_names[prefix]
+                hint = self._submodule_hints.get(prefix, "")
+            elif root in self._imported_names:
+                base = self._imported_names[root]
+                # `import a.b` (no alias) binds the name `a`, but the call
+                # may spell out the full imported path (`a.b.func()`).
+                # Prefer the literal dotted prefix when it matches the
+                # imported target so the call resolves against the right
+                # submodule file instead of the (possibly wrong) package.
+                full_mod = prefix if prefix == base else base
+                hint = prefix if prefix == base else self._submodule_hints.get(root, "")
+
+            if full_mod:
+                self._pending_calls.append((caller_id, func_name, full_mod, lineno, hint))
+            elif root in self._import_map:
                 # Fall back to a module-level edge when cross-file resolution isn't possible
-                mid = _module_id(self._import_map[alias])
+                mid = _module_id(self._import_map[root])
                 self._add_rel(caller_id, mid, "calls", 0)
-        # Truly unresolvable calls (builtins, locals via variables, etc.) are dropped
+            return
+
+        # 4. Bare name not yet defined in this file — may be a forward
+        # reference to a function defined later in the same file (Python
+        # doesn't require functions be defined before use). Defer until the
+        # whole file has been walked so definition order doesn't matter;
+        # names that still don't match a local function are genuinely
+        # unresolvable (builtins, closures over local variables, star
+        # imports, etc.) and stay dropped, same as before.
+        self._pending_same_file_calls.append((caller_id, name, lineno))
+
+    def _resolve_pending_same_file_calls(self) -> None:
+        """Resolve same-file forward-reference calls now that every function
+        in the file has been registered in ``_defined_funcs``."""
+        for caller_id, name, lineno in self._pending_same_file_calls:
+            target = self._defined_funcs.get(name)
+            if target:
+                self._add_rel(caller_id, target, "calls", lineno)
 
     def _extract_call_name(self, call: ast.Call) -> Optional[str]:
         return self._extract_name(call.func)
@@ -466,8 +555,15 @@ class PythonParser:
         py_files = list(self._walk_py_files(root))
         logger.info(f"Found {len(py_files)} Python files to parse.")
 
-        # First pass: collect all class/function definitions for cross-file resolution
-        # We do a two-pass strategy: pass 1 = register names, pass 2 = resolve calls
+        # Parse each file. This is a genuine two-pass strategy at both levels:
+        #   - Within a file, _parse_file's AST walk registers every function
+        #     as it's encountered and resolves calls to already-known local
+        #     functions immediately, deferring calls to not-yet-seen names
+        #     (forward references) until the whole file has been walked
+        #     (see _FileVisitor._resolve_pending_same_file_calls).
+        #   - Across files, calls to imported symbols are collected as
+        #     pending and resolved below in a second full pass, once every
+        #     file's entities are known.
         for rel_path, abs_path in py_files:
             self._parse_file(rel_path, abs_path, result)
 
@@ -509,8 +605,18 @@ class PythonParser:
                 sym_index[(entity.file_path, entity.name)] = entity.node_id
 
         resolved = 0
-        for caller_id, sym_name, full_module, lineno in result.pending_calls:
-            file_path = module_to_path.get(full_module)
+        for caller_id, sym_name, full_module, lineno, submodule_hint in result.pending_calls:
+            file_path = None
+            # 1. The imported name might itself be a submodule (e.g.
+            #    `from pkg import submodule; submodule.func()`) — try that
+            #    file first so we don't look up `func` in the wrong file
+            #    (pkg/__init__.py instead of pkg/submodule.py).
+            if submodule_hint:
+                file_path = module_to_path.get(submodule_hint)
+            # 2. Fall back to treating the call target as a symbol defined
+            #    directly inside `full_module`.
+            if not file_path:
+                file_path = module_to_path.get(full_module)
             if not file_path:
                 continue
             target_id = sym_index.get((file_path, sym_name))
@@ -569,8 +675,11 @@ class PythonParser:
         file_entity = visitor._file_entity(len(source_lines))
         result.entities.append(file_entity)
 
-        # Walk the AST
+        # Walk the AST, then resolve any same-file forward-reference calls
+        # now that every function in the file is known (see
+        # _resolve_pending_same_file_calls).
         visitor.visit(tree)
+        visitor._resolve_pending_same_file_calls()
 
         result.entities.extend(visitor.entities)
         result.relationships.extend(visitor.relationships)

@@ -17,7 +17,10 @@ Run
 
 from __future__ import annotations
 
+import argparse
 import json
+import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -56,7 +59,12 @@ def _load_edges(out: Path) -> Optional[pd.DataFrame]:
 
 def _load_features(out: Path) -> Optional[pd.DataFrame]:
     p = out / "features.csv"
-    return pd.read_csv(p) if p.exists() else None
+    # features.csv is written with the node_id index as its first column
+    # (FeatureExtractor.extract sets index="node_id"). index_col=0 restores
+    # it as the DataFrame index so `nid in features_df.index` lookups
+    # elsewhere (Node Inspector tab) actually match instead of comparing
+    # against a default RangeIndex.
+    return pd.read_csv(p, index_col=0) if p.exists() else None
 
 
 def _build_pyvis_html(edges_df: pd.DataFrame, predictions_df: Optional[pd.DataFrame]) -> str:
@@ -113,9 +121,35 @@ def _build_pyvis_html(edges_df: pd.DataFrame, predictions_df: Optional[pd.DataFr
     for _, row in sample.iterrows():
         net.add_edge(str(row["source"]), str(row["target"]))
 
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
-        net.save_graph(f.name)
-        return Path(f.name).read_text(encoding="utf-8")
+    # pyvis's Network.save_graph() opens the target path itself to write the
+    # HTML. NamedTemporaryFile(delete=False) keeps its own handle open on
+    # the same path at the same time, which fails with PermissionError on
+    # Windows (a second process/handle can't open a file another handle
+    # already has open for writing). Hand pyvis a path in a fresh temp
+    # directory instead, with no concurrently-open handle of our own, and
+    # clean the directory up explicitly once we've read the content back.
+    tmp_dir = tempfile.mkdtemp(prefix="graphguard_pyvis_")
+    try:
+        html_path = Path(tmp_dir) / "graph.html"
+        net.save_graph(str(html_path))
+        return html_path.read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _default_repo_path() -> str:
+    """Read --repo from argv, if present.
+
+    `graphguard dashboard <repo>` (cli.py) launches this script via
+    `streamlit run app.py -- --repo=<repo>`; Streamlit forwards everything
+    after `--` to this script's sys.argv unmodified. Without parsing it,
+    the sidebar always defaulted to "examples/sample_project" regardless
+    of what the user passed on the command line.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--repo", default="examples/sample_project")
+    args, _ = parser.parse_known_args(sys.argv[1:])
+    return args.repo
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +162,7 @@ st.sidebar.divider()
 
 repo_path_input = st.sidebar.text_input(
     "Repository path",
-    value="examples/sample_project",
+    value=_default_repo_path(),
     help="Absolute or relative path to the Python repository to analyze.",
 )
 

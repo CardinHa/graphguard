@@ -26,6 +26,7 @@ from rich.table import Table
 
 from graphguard.utils.config import Config, ModelConfig
 from graphguard.utils.logging import console, get_logger
+from graphguard.utils.optional_deps import missing_dependency_message
 
 logger = get_logger(__name__)
 
@@ -115,7 +116,12 @@ def train(
     dropout: float = typer.Option(0.3, "--dropout"),
 ) -> None:
     """[cyan]Full training pipeline: parse -> graph -> GNN -> baselines -> report.[/]"""
-    from graphguard.models.train import run_full_pipeline
+    try:
+        from graphguard.models.train import run_full_pipeline
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('gnn', 'graphguard train')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
 
     repo = Path(repo_path)
     if not repo.exists():
@@ -242,11 +248,17 @@ def explain(
 
     from rich.table import Table
 
-    from graphguard.data.dataset import CodeGraphDataset
+    try:
+        from graphguard.data.dataset import CodeGraphDataset
+        from graphguard.models.explain import explain_node, load_model
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('gnn', 'graphguard explain')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
+
     from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
     from graphguard.graph.features import FeatureExtractor
     from graphguard.graph.graph_builder import GraphBuilder
-    from graphguard.models.explain import explain_node, load_model
     from graphguard.parser.python_parser import PythonParser
 
     repo = Path(repo_path)
@@ -383,6 +395,13 @@ def dashboard(
     """[cyan]Launch the Streamlit dashboard.[/]"""
     import subprocess
 
+    try:
+        import streamlit  # noqa: F401
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('dash', 'The dashboard')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
+
     dashboard_path = Path(__file__).parent / "dashboard" / "app.py"
 
     env_args = []
@@ -420,7 +439,14 @@ def api(
     reload: bool = typer.Option(False, "--reload", help="Hot reload (dev only)"),
 ) -> None:
     """[cyan]Launch the FastAPI REST server.[/]"""
-    import uvicorn
+    try:
+        import uvicorn
+
+        import graphguard.api.main  # noqa: F401 — validates fastapi is importable too
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('serve', 'graphguard api')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
 
     console.print(f"[cyan]Starting GraphGuard API at http://{host}:{port}[/]")
     uvicorn.run(

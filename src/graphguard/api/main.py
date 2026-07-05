@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from graphguard.utils.logging import get_logger
+from graphguard.utils.optional_deps import missing_dependency_message
 
 logger = get_logger(__name__)
 
@@ -148,7 +149,13 @@ def analyze(request: AnalyzeRequest) -> dict[str, Any]:
     This is a synchronous endpoint that runs the full pipeline inline.
     For large repositories, consider wrapping in a background task.
     """
-    from graphguard.models.train import run_full_pipeline
+    try:
+        from graphguard.models.train import run_full_pipeline
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=f"{missing_dependency_message('gnn', 'POST /analyze')} ({exc})",
+        )
     from graphguard.utils.config import Config, ModelConfig
 
     repo = _resolve_within_root(request.repo_path, "repo_path")
@@ -257,11 +264,17 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
       - Function or class name (e.g. "resolve_proxies")
       - Substring of a node_id (e.g. "utils.py")
     """
-    from graphguard.data.dataset import CodeGraphDataset
+    try:
+        from graphguard.data.dataset import CodeGraphDataset
+        from graphguard.models.explain import explain_node, load_model
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=f"{missing_dependency_message('gnn', 'POST /explain')} ({exc})",
+        )
     from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
     from graphguard.graph.features import FeatureExtractor
     from graphguard.graph.graph_builder import GraphBuilder
-    from graphguard.models.explain import explain_node, load_model
     from graphguard.parser.python_parser import PythonParser
     from graphguard.utils.config import Config, ModelConfig
 

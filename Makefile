@@ -9,9 +9,9 @@ help:           ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
 
-install:        ## Install package + dev dependencies
+install:        ## Install package + all extras + dev dependencies
 	pip install -r requirements.txt
-	pip install -e ".[dev]"
+	pip install -e ".[dev,gnn,serve,dash,git]"
 
 test:           ## Run the full test suite
 	pytest tests/ -v

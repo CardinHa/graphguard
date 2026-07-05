@@ -216,6 +216,22 @@ risk_score = 0.4 * norm(fan_in) + 0.3 * norm(betweenness) + 0.3 * norm(complexit
 
 ## Installation
 
+Core install (`pip install -e .`) only pulls in networkx/pandas/numpy/
+scikit-learn/typer/rich/pydantic/scipy — enough to run `graphguard analyze`
+(parse a repo, build the dependency graph, extract features). Everything
+else is an optional extra, since not every use of GraphGuard needs a GNN
+runtime, a REST server, a dashboard, or git history mining:
+
+| Extra    | Adds                        | Needed for |
+|----------|------------------------------|------------|
+| `gnn`    | torch, torch-geometric       | `graphguard train`, `graphguard explain`, POST /analyze, POST /explain |
+| `serve`  | fastapi, uvicorn             | `graphguard api` |
+| `dash`   | streamlit, plotly, pyvis     | `graphguard dashboard` |
+| `git`    | gitpython                    | `--label-mode git` |
+
+Commands that need a missing extra print a `pip install graphguard[...]`
+hint instead of a raw import traceback.
+
 ### Option 1: pip (development install)
 
 ```bash
@@ -226,11 +242,15 @@ cd graphguard
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Install GraphGuard itself (editable)
+# Core only (graphguard analyze):
 pip install -e .
+
+# Everything (dev convenience — matches requirements.txt):
+pip install -r requirements.txt
+pip install -e ".[dev,gnn,serve,dash,git]"
+
+# Or pick only the extras you need, e.g. training + the API:
+pip install -e ".[gnn,serve]"
 ```
 
 ### Option 2: Docker
@@ -239,6 +259,9 @@ pip install -e .
 docker build -t graphguard .
 docker run --rm graphguard --help
 ```
+
+The Docker image installs every extra (see `requirements.txt` in the
+image), so all commands work out of the box inside the container.
 
 ### PyTorch Geometric note
 

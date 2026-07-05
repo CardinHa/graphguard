@@ -179,7 +179,13 @@ epochs = st.sidebar.slider("Training epochs", 50, 500, 200, step=50)
 run_btn = st.sidebar.button("▶ Run Full Pipeline", type="primary", use_container_width=True)
 
 if run_btn:
-    from graphguard.models.train import run_full_pipeline
+    try:
+        from graphguard.models.train import run_full_pipeline
+    except ImportError as exc:
+        from graphguard.utils.optional_deps import missing_dependency_message
+        st.sidebar.error(f"{missing_dependency_message('gnn', 'The training pipeline')} ({exc})")
+        st.stop()
+
     from graphguard.utils.config import Config, ModelConfig
 
     repo = Path(repo_path_input)
@@ -380,12 +386,18 @@ with tab4:
             else:
                 import json as _json
 
-                from graphguard.data.dataset import CodeGraphDataset
+                try:
+                    from graphguard.data.dataset import CodeGraphDataset
+                    from graphguard.models.explain import explain_node as _explain_node
+                    from graphguard.models.explain import load_model
+                except ImportError as exc:
+                    from graphguard.utils.optional_deps import missing_dependency_message
+                    st.error(f"{missing_dependency_message('gnn', 'GNNExplainer')} ({exc})")
+                    st.stop()
+
                 from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
                 from graphguard.graph.features import FeatureExtractor
                 from graphguard.graph.graph_builder import GraphBuilder
-                from graphguard.models.explain import explain_node as _explain_node
-                from graphguard.models.explain import load_model
                 from graphguard.parser.python_parser import PythonParser
                 from graphguard.utils.config import Config, ModelConfig
 

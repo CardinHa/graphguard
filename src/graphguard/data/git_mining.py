@@ -21,6 +21,7 @@ from typing import Optional
 
 from graphguard.utils.config import BUG_KEYWORDS
 from graphguard.utils.logging import get_logger
+from graphguard.utils.optional_deps import missing_dependency_message
 
 logger = get_logger(__name__)
 
@@ -62,8 +63,7 @@ class GitMiner:
             import git  # gitpython
         except ImportError:
             logger.warning(
-                "Git mining unavailable: gitpython is not installed. "
-                "Install it with: pip install graphguard[git]"
+                f"Git mining unavailable: {missing_dependency_message('git', 'Git-based labeling')}"
             )
             return False
         try:

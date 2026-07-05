@@ -412,7 +412,10 @@ def dashboard(
 
 @app.command()
 def api(
-    host: str = typer.Option("0.0.0.0", "--host"),
+    host: str = typer.Option(
+        "127.0.0.1", "--host",
+        help="Bind address. Use 0.0.0.0 explicitly to listen on all interfaces.",
+    ),
     port: int = typer.Option(8000, "--port", "-p"),
     reload: bool = typer.Option(False, "--reload", help="Hot reload (dev only)"),
 ) -> None:

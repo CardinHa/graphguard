@@ -137,7 +137,8 @@ class CodeGraphDataset:
             y[i] = labels.get(nid, 0) if scorable[i] else 0
 
         # ---- Masks (only over scorable nodes) ----
-        train_mask, val_mask, test_mask = self._split_masks(N, scorable_idx)
+        file_keys = self._file_group_keys(features_df, nodes)
+        train_mask, val_mask, test_mask = self._split_masks(N, scorable_idx, file_keys)
         scorable_mask = torch.zeros(N, dtype=torch.bool)
         for i in scorable_idx:
             scorable_mask[i] = True
@@ -254,24 +255,85 @@ class CodeGraphDataset:
         risky = ((score >= threshold) & scorable_series).astype(int)
         return risky.to_dict()
 
-    def _split_masks(
-        self, N: int, scorable_idx: list[int]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Create reproducible train/val/test masks over scorable nodes only."""
-        rng = np.random.default_rng(seed=42)
-        perm = rng.permutation(np.asarray(scorable_idx, dtype=np.int64))
-        n_s = len(perm)
+    @staticmethod
+    def _file_group_keys(df: pd.DataFrame, nodes: list[str]) -> list[str]:
+        """
+        Return a per-node "file group" key used to keep same-file entities
+        together during the train/val/test split (see ``_split_masks``).
 
-        train_end = int(n_s * self.config.train_frac)
-        val_end = train_end + int(n_s * self.config.val_frac)
+        Every node carries the repo-relative path of the file it belongs to
+        (the file node's own path, or the containing file's path for a
+        function/class — see ``ParsedEntity.file_path``). Nodes with no
+        usable file path (e.g. external ``module::`` stubs, which are never
+        scorable anyway) fall back to a unique per-node key so they never
+        get accidentally grouped with unrelated nodes.
+        """
+        if "file_path" not in df.columns:
+            return [f"__node_{i}__" for i in range(len(nodes))]
+        raw = df.reindex(nodes)["file_path"].fillna("").astype(str).tolist()
+        return [fp if fp else f"__node_{i}__" for i, fp in enumerate(raw)]
+
+    def _split_masks(
+        self, N: int, scorable_idx: list[int], group_keys: list[str]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Create reproducible train/val/test masks over scorable nodes only,
+        grouped by containing file.
+
+        Git-mode labels are assigned per-file and then propagated to every
+        function/class in that file (see
+        ``GitMiner.file_labels_to_node_labels``). A naive random node-level
+        split would therefore routinely place same-file siblings — which
+        share an identical label — on both sides of train/test, leaking
+        label information and inflating held-out metrics. Splitting by
+        file group instead guarantees every node belonging to the same file
+        lands in exactly one of train/val/test.
+
+        Split fractions (``train_frac`` / ``val_frac``) are preserved
+        approximately: whole file-groups are assigned to a split in
+        seed-shuffled order until that split's target size is reached.
+        """
+        rng = np.random.default_rng(seed=42)
+
+        # Group scorable node indices by their containing file.
+        groups: dict[str, list[int]] = {}
+        for i in scorable_idx:
+            groups.setdefault(group_keys[i], []).append(i)
+
+        # Deterministic base order, then seeded shuffle of the groups
+        # themselves (not the individual nodes) so a whole file always
+        # moves together.
+        group_order = sorted(groups.keys())
+        perm = rng.permutation(len(group_order))
+        shuffled_keys = [group_order[p] for p in perm]
+
+        n_s = len(scorable_idx)
+        train_target = int(n_s * self.config.train_frac)
+        val_target = int(n_s * self.config.val_frac)
+
+        train_idx: list[int] = []
+        val_idx: list[int] = []
+        test_idx: list[int] = []
+
+        for key in shuffled_keys:
+            members = groups[key]
+            if len(train_idx) < train_target:
+                train_idx.extend(members)
+            elif len(val_idx) < val_target:
+                val_idx.extend(members)
+            else:
+                test_idx.extend(members)
 
         train_mask = torch.zeros(N, dtype=torch.bool)
         val_mask = torch.zeros(N, dtype=torch.bool)
         test_mask = torch.zeros(N, dtype=torch.bool)
 
-        train_mask[perm[:train_end].tolist()] = True
-        val_mask[perm[train_end:val_end].tolist()] = True
-        test_mask[perm[val_end:].tolist()] = True
+        if train_idx:
+            train_mask[train_idx] = True
+        if val_idx:
+            val_mask[val_idx] = True
+        if test_idx:
+            test_mask[test_idx] = True
 
         return train_mask, val_mask, test_mask
 

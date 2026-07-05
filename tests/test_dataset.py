@@ -20,6 +20,24 @@ from graphguard.parser.python_parser import (
 )
 
 
+def _toy_graph_many_files(num_files: int = 20, funcs_per_file: int = 2) -> nx.DiGraph:
+    """Many small files, each with a file node + a few functions, so the
+    file-grouped split has enough groups to exercise ratio preservation."""
+    entities: list[ParsedEntity] = []
+    rels: list[ParsedRelationship] = []
+    for i in range(num_files):
+        fp = f"pkg/file_{i}.py"
+        file_id = f"file::{fp}"
+        entities.append(ParsedEntity(file_id, f"file_{i}.py", "file", fp, 1, lines_of_code=10))
+        for j in range(funcs_per_file):
+            fid = f"func::{fp}::fn_{j}"
+            entities.append(
+                ParsedEntity(fid, f"fn_{j}", "function", fp, 2 + j, num_params=1, complexity=2)
+            )
+            rels.append(ParsedRelationship(file_id, fid, "contains", fp))
+    return GraphBuilder().build(ParseResult(entities=entities, relationships=rels))
+
+
 def _toy_graph_with_module() -> nx.DiGraph:
     """A file + function + a high-fan-in external module."""
     entities = [
@@ -93,6 +111,50 @@ class TestScorableNodes:
 
         preds = pd.read_csv(out)
         assert not preds["entity_type"].isin(["module", "unknown"]).any()
+
+
+class TestFileGroupedSplit:
+    """Regression tests for the group-leakage fix: same-file siblings must
+    never land in two different splits (see dataset.py _split_masks)."""
+
+    def test_no_file_spans_two_splits(self, builder: CodeGraphDataset) -> None:
+        G = _toy_graph_many_files()
+        df = FeatureExtractor().extract(G)
+        data, _ = builder.build(G, df)
+
+        splits_by_file: dict[str, set[str]] = {}
+        for i, nid in enumerate(data.node_ids):
+            fp = df.loc[nid, "file_path"] if nid in df.index else ""
+            if not fp:
+                continue
+            if bool(data.train_mask[i]):
+                splits_by_file.setdefault(fp, set()).add("train")
+            elif bool(data.val_mask[i]):
+                splits_by_file.setdefault(fp, set()).add("val")
+            elif bool(data.test_mask[i]):
+                splits_by_file.setdefault(fp, set()).add("test")
+
+        offenders = {fp: s for fp, s in splits_by_file.items() if len(s) > 1}
+        assert offenders == {}, f"Files spanning multiple splits: {offenders}"
+
+    def test_split_is_deterministic(self, builder: CodeGraphDataset) -> None:
+        G = _toy_graph_many_files()
+        df = FeatureExtractor().extract(G)
+        data1, _ = builder.build(G, df)
+        data2, _ = builder.build(G, df)
+        assert data1.train_mask.tolist() == data2.train_mask.tolist()
+        assert data1.val_mask.tolist() == data2.val_mask.tolist()
+        assert data1.test_mask.tolist() == data2.test_mask.tolist()
+
+    def test_split_ratios_approximately_preserved(self, builder: CodeGraphDataset) -> None:
+        G = _toy_graph_many_files(num_files=30, funcs_per_file=2)
+        df = FeatureExtractor().extract(G)
+        data, meta = builder.build(G, df)
+
+        n_scorable = meta.train_size + meta.val_size + meta.test_size
+        assert n_scorable > 0
+        assert meta.train_size / n_scorable == pytest.approx(0.70, abs=0.15)
+        assert meta.val_size / n_scorable == pytest.approx(0.15, abs=0.1)
 
 
 class TestDataShape:

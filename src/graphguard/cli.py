@@ -22,11 +22,18 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from graphguard.utils.config import Config, ModelConfig
 from graphguard.utils.logging import console, get_logger
-from graphguard.utils.optional_deps import missing_dependency_message
+from graphguard.utils.optional_deps import missing_dependency_message as _mdm
+
+
+def missing_dependency_message(extra: str, feature: str) -> str:
+    """Rich-safe wrapper: escape the literal [extra] in the pip hint so
+    console.print doesn't swallow it as markup."""
+    return _rich_escape(_mdm(extra, feature))
 
 logger = get_logger(__name__)
 

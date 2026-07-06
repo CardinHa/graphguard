@@ -62,8 +62,13 @@ class GitMiner:
         try:
             import git  # gitpython
         except ImportError:
+            # The log handler renders rich markup — escape so the literal
+            # [git] in the pip hint isn't swallowed as a markup tag.
+            from rich.markup import escape
+
             logger.warning(
-                f"Git mining unavailable: {missing_dependency_message('git', 'Git-based labeling')}"
+                "Git mining unavailable: "
+                f"{escape(missing_dependency_message('git', 'Git-based labeling'))}"
             )
             return False
         try:

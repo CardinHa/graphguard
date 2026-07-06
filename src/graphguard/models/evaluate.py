@@ -54,7 +54,26 @@ def compute_metrics(
     y_pred: np.ndarray,
     y_prob: Optional[np.ndarray] = None,
 ) -> ModelMetrics:
-    """Compute all classification metrics for a single model."""
+    """Compute all classification metrics for a single model.
+
+    An empty evaluation split (possible on very small repos, where the
+    file-grouped split cannot populate every split — see
+    ``CodeGraphDataset._split_masks``) yields all-zero metrics with a loud
+    warning instead of a sklearn "empty input array" crash.
+    """
+    if len(y_true) == 0:
+        logger.warning(
+            f"compute_metrics({model_name}): evaluation split is EMPTY — "
+            "metrics are reported as 0.0 and are meaningless. This happens "
+            "when the repo has too few files for the file-grouped split to "
+            "populate every split."
+        )
+        return ModelMetrics(
+            model_name=model_name,
+            accuracy=0.0, precision=0.0, recall=0.0,
+            f1=0.0, roc_auc=0.0, pr_auc=0.0,
+        )
+
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)

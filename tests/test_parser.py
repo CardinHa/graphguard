@@ -320,3 +320,76 @@ class TestCrossFileCallResolution:
         # _add_rel skips src == tgt, so there should be no self-loop
         self_loops = [r for r in calls if r.source_id == r.target_id]
         assert self_loops == []
+
+    def test_forward_reference_call_resolved(self, tmp_repo: Path) -> None:
+        """def a(): b() defined BEFORE def b(): ... must still produce the
+        a -> b calls edge (regression test: calls must not depend on
+        definition order within a file)."""
+        code = "def a():\n    b()\n\ndef b():\n    pass\n"
+        result = _parse_snippet(tmp_repo, code)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        assert any(
+            r.source_id.endswith("::a") and r.target_id.endswith("::b")
+            for r in calls
+        ), f"Expected forward-reference a->b call edge, got: {[(r.source_id, r.target_id) for r in calls]}"
+
+    def test_nested_function_call_not_double_counted(self, tmp_repo: Path) -> None:
+        """A call inside a nested function must be attributed to the nested
+        function only — not also to the enclosing outer function."""
+        code = textwrap.dedent("""\
+            def helper():
+                pass
+
+            def outer():
+                def inner():
+                    helper()
+                inner()
+        """)
+        result = _parse_snippet(tmp_repo, code)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        outer_to_helper = [
+            r for r in calls
+            if r.source_id.endswith("::outer") and r.target_id.endswith("::helper")
+        ]
+        inner_to_helper = [
+            r for r in calls
+            if r.source_id.endswith("::inner") and r.target_id.endswith("::helper")
+        ]
+        outer_to_inner = [
+            r for r in calls
+            if r.source_id.endswith("::outer") and r.target_id.endswith("::inner")
+        ]
+        assert outer_to_helper == [], "helper() was double-counted against the outer function"
+        assert len(inner_to_helper) == 1
+        assert len(outer_to_inner) == 1
+
+    def test_absolute_submodule_import_attribute_call_resolved(self, tmp_repo: Path) -> None:
+        """from pkg import submodule; submodule.func() must resolve into
+        pkg/submodule.py, not be looked up (and dropped/misattributed) in
+        pkg/__init__.py."""
+        (tmp_repo / "pkg").mkdir()
+        _write(tmp_repo, "pkg/__init__.py", "")
+        _write(tmp_repo, "pkg/submodule.py", "def func():\n    pass\n")
+        _write(tmp_repo, "pkg/main.py",
+               "from pkg import submodule\ndef run():\n    submodule.func()\n")
+        result = PythonParser().parse(tmp_repo)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        assert any(r.target_id == "func::pkg/submodule.py::func" for r in calls), (
+            f"Expected edge into pkg/submodule.py::func, got: "
+            f"{[r.target_id for r in calls]}"
+        )
+
+    def test_dotted_import_attribute_call_resolved(self, tmp_repo: Path) -> None:
+        """import a.b; a.b.func() must resolve into a/b.py. `import a.b`
+        binds the name `a`, not the literal string "a.b" — the parser must
+        key the binding accordingly."""
+        (tmp_repo / "a").mkdir()
+        _write(tmp_repo, "a/__init__.py", "")
+        _write(tmp_repo, "a/b.py", "def func():\n    pass\n")
+        _write(tmp_repo, "a/main.py",
+               "import a.b\ndef run():\n    a.b.func()\n")
+        result = PythonParser().parse(tmp_repo)
+        calls = [r for r in result.relationships if r.relationship_type == "calls"]
+        assert any(r.target_id == "func::a/b.py::func" for r in calls), (
+            f"Expected edge into a/b.py::func, got: {[r.target_id for r in calls]}"
+        )

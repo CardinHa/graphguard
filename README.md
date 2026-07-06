@@ -216,6 +216,22 @@ risk_score = 0.4 * norm(fan_in) + 0.3 * norm(betweenness) + 0.3 * norm(complexit
 
 ## Installation
 
+Core install (`pip install -e .`) only pulls in networkx/pandas/numpy/
+scikit-learn/typer/rich/pydantic/scipy — enough to run `graphguard analyze`
+(parse a repo, build the dependency graph, extract features). Everything
+else is an optional extra, since not every use of GraphGuard needs a GNN
+runtime, a REST server, a dashboard, or git history mining:
+
+| Extra    | Adds                        | Needed for |
+|----------|------------------------------|------------|
+| `gnn`    | torch, torch-geometric       | `graphguard train`, `graphguard explain`, POST /analyze, POST /explain |
+| `serve`  | fastapi, uvicorn             | `graphguard api` |
+| `dash`   | streamlit, plotly, pyvis     | `graphguard dashboard` |
+| `git`    | gitpython                    | `--label-mode git` |
+
+Commands that need a missing extra print a `pip install graphguard[...]`
+hint instead of a raw import traceback.
+
 ### Option 1: pip (development install)
 
 ```bash
@@ -226,11 +242,15 @@ cd graphguard
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Install GraphGuard itself (editable)
+# Core only (graphguard analyze):
 pip install -e .
+
+# Everything (dev convenience — matches requirements.txt):
+pip install -r requirements.txt
+pip install -e ".[dev,gnn,serve,dash,git]"
+
+# Or pick only the extras you need, e.g. training + the API:
+pip install -e ".[gnn,serve]"
 ```
 
 ### Option 2: Docker
@@ -239,6 +259,9 @@ pip install -e .
 docker build -t graphguard .
 docker run --rm graphguard --help
 ```
+
+The Docker image installs every extra (see `requirements.txt` in the
+image), so all commands work out of the box inside the container.
 
 ### PyTorch Geometric note
 
@@ -412,45 +435,42 @@ pytest tests/test_parser.py -v
 
 ### Real-world validation: `psf/requests` (`--label-mode git`)
 
+> ⚠️ **Known issue — numbers below are pre-fix and will be re-run.** An audit found that
+> the train/val/test split in `CodeGraphDataset._split_masks` assigned nodes to splits
+> independently at random. Git-mode labels are file-level and are propagated to *every*
+> function/class in a file (see `GitMiner.file_labels_to_node_labels`), so same-file
+> siblings sharing an identical label could end up on both sides of train/test. That is
+> label leakage, and it inflates held-out metrics — most visibly the precision = 1.0000
+> and ROC-AUC = 0.9894 figures previously reported here.
+>
+> The split has since been fixed to group by file (every node belonging to the same file
+> now lands in exactly one of train/val/test; see `dataset.py`), which removes this
+> leakage path. The benchmark below has **not yet been re-run** against the fixed split —
+> treat the table as a historical, pre-fix artifact rather than a current performance
+> claim. We are intentionally not inventing new numbers here; a corrected benchmark run
+> is tracked as follow-up work.
+
 GraphGuard was run against the full [`requests`](https://github.com/psf/requests) source tree
 using 500 commits of git history for labeling (1,876 commits scanned, 124 files flagged via
-bug-fix keyword matching). All numbers below are on a held-out test split.
+bug-fix keyword matching). All numbers below are on a held-out test split from the
+**pre-fix, leaky** random node-level split.
 
 **Graph:** 835 nodes · 1,872 edges · 753 scorable (files/functions/classes)
 (1,536 structural edges + **336 cross-file call edges** resolved via import tracking)
 
 | Model | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC |
 |-------|----------|-----------|--------|----|---------|--------|
-| **GraphSAGE** | **0.8421** | **1.0000** | **0.8302** | **0.9072** | **0.9894** | **0.9992** |
+| **GraphSAGE** | 0.8421 | 1.0000 | 0.8302 | 0.9072 | 0.9894 | 0.9992 |
 | LogisticRegression | 0.7456 | 0.9753 | 0.7453 | 0.8449 | 0.7700 | 0.9760 |
 | RandomForest | 0.9386 | 0.9901 | 0.9434 | 0.9662 | 0.9723 | 0.9978 |
 
+*(pre-fix, to be re-run against the file-grouped split)*
+
 **Top flagged nodes (GNN risk score > 0.99):** all functions in `utils.py` —
 `get_proxy`, `resolve_proxies`, `requote_uri`, `super_len`, and 15 more.
-This is exactly right: `utils.py` is the most-edited file in the `requests` history
-and has the highest fan-in of any module.
-
-**What the numbers say:**
-
-1. **GraphSAGE ROC-AUC 0.9894 vs LogReg 0.7700** — +18.94 points from neighborhood
-   aggregation. Both models see the same per-node features; the GNN additionally aggregates
-   signal from each node's callers and importers across file boundaries. The cross-file
-   call graph is what drives this gap: LogReg cannot see which files call into a risky
-   module, but GraphSAGE propagates that risk through the edge structure.
-
-2. **GraphSAGE precision = 1.00.** When the GNN fires, it is never wrong. That matters
-   for code-review tooling: a recommendation you can trust is more useful than a high-recall
-   flood of noise.
-
-3. **RandomForest 0.9723 ROC-AUC — legitimate, but below SAGE.** Git labels are assigned
-   from commit history, not derived from node features, so there is no leakage. RF is
-   genuinely strong; GraphSAGE beats it on ROC-AUC because the call-graph topology provides
-   risk signal that no set of per-node features can encode.
-
-4. **Feature importance shifts under real labels:** with git labels, **PageRank is the #1
-   predictor (44%)**, vs complexity (49%) under synthetic labels. Bug-prone code really is
-   structurally central — it's not just locally complex, it's deeply woven into the
-   dependency graph. This is the graph-theory insight the model is learning.
+`utils.py` is the most-edited file in the `requests` history and has the highest fan-in
+of any module, so this direction of the signal is plausible — but the exact magnitude of
+the numbers above should not be trusted until the benchmark is re-run post-fix.
 
 ---
 
@@ -585,7 +605,7 @@ The same mathematical primitives — adjacency matrices, graph traversal, eigenv
 
 ### What happens when you run on a real codebase?
 
-"On `psf/requests` with 500 commits of git history, the GNN achieves ROC-AUC 0.9894 vs LogReg's 0.7700 — a +18.94 point gap. The key factor is cross-file call resolution: GraphGuard tracks imports across file boundaries, so when `adapters.py` calls `get_encoding_from_headers` in `utils.py`, that edge exists in the graph. GraphSAGE propagates risk through those edges; LogReg has no access to that topology at all. PageRank also becomes the #1 predictor (44%) over complexity (49% on synthetic labels), which is a signal the tabular models can compute but can't use relationally — the GNN's 2-hop aggregation is what turns it into a meaningful embedding."
+"On `psf/requests` with 500 commits of git history, the pre-fix run showed the GNN at ROC-AUC 0.9894 vs LogReg's 0.7700 — a +18.94 point gap. **Update: that split had a file-level label-leakage bug** (see 'Model Results' above), so those exact numbers are being re-run and shouldn't be quoted as current. The mechanism story still holds directionally: the key factor is cross-file call resolution — GraphGuard tracks imports across file boundaries, so when `adapters.py` calls `get_encoding_from_headers` in `utils.py`, that edge exists in the graph, and GraphSAGE propagates risk through those edges while LogReg has no access to that topology at all. PageRank also became the #1 predictor (44%) over complexity (49% on synthetic labels) in the pre-fix run — a signal the tabular models can compute but can't use relationally."
 
 ### How does GNNExplainer work?
 

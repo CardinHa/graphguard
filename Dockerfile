@@ -18,5 +18,7 @@ RUN pip install --no-cache-dir -e .
 ENTRYPOINT ["graphguard"]
 CMD ["--help"]
 
-# To launch API:  docker run -p 8000:8000 graphguard api
+# To launch API:  docker run -p 8000:8000 graphguard api --host 0.0.0.0
+#   (the API binds to 127.0.0.1 by default for local-use safety; inside a
+#   container it must bind 0.0.0.0 to be reachable via the published port)
 # To launch dashboard: docker run -p 8501:8501 graphguard dashboard

@@ -22,10 +22,18 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from rich.markup import escape as _rich_escape
 from rich.table import Table
 
 from graphguard.utils.config import Config, ModelConfig
 from graphguard.utils.logging import console, get_logger
+from graphguard.utils.optional_deps import missing_dependency_message as _mdm
+
+
+def missing_dependency_message(extra: str, feature: str) -> str:
+    """Rich-safe wrapper: escape the literal [extra] in the pip hint so
+    console.print doesn't swallow it as markup."""
+    return _rich_escape(_mdm(extra, feature))
 
 logger = get_logger(__name__)
 
@@ -115,7 +123,12 @@ def train(
     dropout: float = typer.Option(0.3, "--dropout"),
 ) -> None:
     """[cyan]Full training pipeline: parse -> graph -> GNN -> baselines -> report.[/]"""
-    from graphguard.models.train import run_full_pipeline
+    try:
+        from graphguard.models.train import run_full_pipeline
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('gnn', 'graphguard train')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
 
     repo = Path(repo_path)
     if not repo.exists():
@@ -242,11 +255,17 @@ def explain(
 
     from rich.table import Table
 
-    from graphguard.data.dataset import CodeGraphDataset
-    from graphguard.data.git_mining import GitMiner
+    try:
+        from graphguard.data.dataset import CodeGraphDataset
+        from graphguard.models.explain import explain_node, load_model
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('gnn', 'graphguard explain')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
+
+    from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
     from graphguard.graph.features import FeatureExtractor
     from graphguard.graph.graph_builder import GraphBuilder
-    from graphguard.models.explain import explain_node, load_model
     from graphguard.parser.python_parser import PythonParser
 
     repo = Path(repo_path)
@@ -270,8 +289,20 @@ def explain(
     console.rule("[bold cyan]GraphGuard · Explain[/]")
     console.print(f"[dim]Reconstructing graph for '{repo_path}' (label_mode={label_mode})...[/]")
 
-    # Steps 1–5: fast rebuild (no training)
-    config = Config(label_mode=label_mode)
+    # Steps 1–5: fast rebuild (no training). Reuse the model hyperparameters
+    # persisted at train time so the reconstructed architecture matches the
+    # saved state_dict — otherwise a non-default hidden_dim/num_layers/
+    # model_type would crash on load.
+    default_mc = ModelConfig()
+    config = Config(
+        label_mode=label_mode,
+        model=ModelConfig(
+            model_type=meta_info.get("model_type", default_mc.model_type),
+            hidden_dim=meta_info.get("hidden_dim", default_mc.hidden_dim),
+            num_layers=meta_info.get("num_layers", default_mc.num_layers),
+            dropout=meta_info.get("dropout", default_mc.dropout),
+        ),
+    )
 
     parser = PythonParser()
     parse_result = parser.parse(repo)
@@ -287,7 +318,12 @@ def explain(
         miner = GitMiner(repo)
         file_counts = miner.mine_bug_fix_labels()
         if file_counts:
-            labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+            try:
+                labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+            except GitLabelPathMismatchError as exc:
+                console.print(f"[bold red]{exc}[/]")
+                console.print("[yellow]Falling back to synthetic labels.[/]")
+                labels = None
 
     dataset_builder = CodeGraphDataset(config)
     data, _ = dataset_builder.build(G, features_df, labels=labels, undirected=False)
@@ -366,6 +402,13 @@ def dashboard(
     """[cyan]Launch the Streamlit dashboard.[/]"""
     import subprocess
 
+    try:
+        import streamlit  # noqa: F401
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('dash', 'The dashboard')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
+
     dashboard_path = Path(__file__).parent / "dashboard" / "app.py"
 
     env_args = []
@@ -395,12 +438,22 @@ def dashboard(
 
 @app.command()
 def api(
-    host: str = typer.Option("0.0.0.0", "--host"),
+    host: str = typer.Option(
+        "127.0.0.1", "--host",
+        help="Bind address. Use 0.0.0.0 explicitly to listen on all interfaces.",
+    ),
     port: int = typer.Option(8000, "--port", "-p"),
     reload: bool = typer.Option(False, "--reload", help="Hot reload (dev only)"),
 ) -> None:
     """[cyan]Launch the FastAPI REST server.[/]"""
-    import uvicorn
+    try:
+        import uvicorn
+
+        import graphguard.api.main  # noqa: F401 — validates fastapi is importable too
+    except ImportError as exc:
+        console.print(f"[red]{missing_dependency_message('serve', 'graphguard api')}[/]")
+        console.print(f"[dim]({exc})[/]")
+        raise typer.Exit(1)
 
     console.print(f"[cyan]Starting GraphGuard API at http://{host}:{port}[/]")
     uvicorn.run(

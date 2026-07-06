@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch_geometric.data import Data
 
 from graphguard.data.dataset import CodeGraphDataset
-from graphguard.data.git_mining import GitMiner
+from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
 from graphguard.graph.features import FeatureExtractor
 from graphguard.graph.graph_builder import GraphBuilder
 from graphguard.models.baselines import BaselineModels
@@ -120,11 +120,25 @@ def train_gnn(
     best_state = None
     patience_counter = 0
 
+    # Very small repos may leave the validation split empty (see
+    # CodeGraphDataset._split_masks). Track training loss for early
+    # stopping/checkpointing in that case so training still completes
+    # instead of comparing against a NaN loss forever.
+    has_val = bool(data.val_mask.sum().item() > 0)
+    if not has_val:
+        logger.warning(
+            "Validation split is empty — early stopping/checkpointing will "
+            "track training loss instead of validation loss."
+        )
+
     console.print(f"[bold cyan]Training {mc.model_type.upper()} on {device}...[/]")
 
     for epoch in range(1, mc.epochs + 1):
         train_loss = _train_epoch(model, data, optimizer, criterion)
-        val_loss, _, _ = _evaluate_split(model, data, data.val_mask, criterion)
+        if has_val:
+            val_loss, _, _ = _evaluate_split(model, data, data.val_mask, criterion)
+        else:
+            val_loss = train_loss
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -198,11 +212,19 @@ def run_full_pipeline(
         miner = GitMiner(repo_path)
         file_counts = miner.mine_bug_fix_labels()
         if file_counts:
-            labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
-            console.print(
-                f"[green]Git labels: {sum(labels.values())} risky / "
-                f"{len(labels)} total nodes[/]"
-            )
+            try:
+                labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+                console.print(
+                    f"[green]Git labels: {sum(labels.values())} risky / "
+                    f"{len(labels)} total nodes[/]"
+                )
+            except GitLabelPathMismatchError as exc:
+                console.print(f"[bold red]{exc}[/]")
+                console.print(
+                    "[yellow]Falling back to synthetic labels due to the path "
+                    "mismatch above.[/]"
+                )
+                labels = None
         else:
             console.print("[yellow]No git history found — falling back to synthetic labels.[/]")
 

@@ -52,7 +52,15 @@ _SYNTHETIC_WARNING = (
 
 @dataclass
 class DatasetMetadata:
-    """Human-readable stats about the constructed dataset."""
+    """Human-readable stats about the constructed dataset.
+
+    Also carries the model hyperparameters used for this run
+    (model_type/hidden_dim/num_layers/dropout). ``graphguard explain`` and
+    POST /explain reconstruct the model from saved weights without
+    retraining, so they need these values to build an architecture that
+    matches the checkpoint — otherwise state_dict shapes mismatch whenever
+    training used non-default hyperparameters.
+    """
     num_nodes: int
     num_edges: int
     num_features: int
@@ -62,6 +70,10 @@ class DatasetMetadata:
     train_size: int
     val_size: int
     test_size: int
+    model_type: str = "sage"
+    hidden_dim: int = 64
+    num_layers: int = 2
+    dropout: float = 0.3
 
     def to_dict(self) -> dict:
         return self.__dict__
@@ -137,7 +149,8 @@ class CodeGraphDataset:
             y[i] = labels.get(nid, 0) if scorable[i] else 0
 
         # ---- Masks (only over scorable nodes) ----
-        train_mask, val_mask, test_mask = self._split_masks(N, scorable_idx)
+        file_keys = self._file_group_keys(features_df, nodes)
+        train_mask, val_mask, test_mask = self._split_masks(N, scorable_idx, file_keys)
         scorable_mask = torch.zeros(N, dtype=torch.bool)
         for i in scorable_idx:
             scorable_mask[i] = True
@@ -166,6 +179,10 @@ class CodeGraphDataset:
             train_size=int(train_mask.sum().item()),
             val_size=int(val_mask.sum().item()),
             test_size=int(test_mask.sum().item()),
+            model_type=self.config.model.model_type,
+            hidden_dim=self.config.model.hidden_dim,
+            num_layers=self.config.model.num_layers,
+            dropout=self.config.model.dropout,
         )
         pct = (meta.num_positive / n_scorable * 100) if n_scorable else 0.0
         logger.info(
@@ -254,24 +271,150 @@ class CodeGraphDataset:
         risky = ((score >= threshold) & scorable_series).astype(int)
         return risky.to_dict()
 
-    def _split_masks(
-        self, N: int, scorable_idx: list[int]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Create reproducible train/val/test masks over scorable nodes only."""
-        rng = np.random.default_rng(seed=42)
-        perm = rng.permutation(np.asarray(scorable_idx, dtype=np.int64))
-        n_s = len(perm)
+    @staticmethod
+    def _file_group_keys(df: pd.DataFrame, nodes: list[str]) -> list[str]:
+        """
+        Return a per-node "file group" key used to keep same-file entities
+        together during the train/val/test split (see ``_split_masks``).
 
-        train_end = int(n_s * self.config.train_frac)
-        val_end = train_end + int(n_s * self.config.val_frac)
+        Every node carries the repo-relative path of the file it belongs to
+        (the file node's own path, or the containing file's path for a
+        function/class — see ``ParsedEntity.file_path``). Nodes with no
+        usable file path (e.g. external ``module::`` stubs, which are never
+        scorable anyway) fall back to a unique per-node key so they never
+        get accidentally grouped with unrelated nodes.
+        """
+        if "file_path" not in df.columns:
+            return [f"__node_{i}__" for i in range(len(nodes))]
+        raw = df.reindex(nodes)["file_path"].fillna("").astype(str).tolist()
+        return [fp if fp else f"__node_{i}__" for i, fp in enumerate(raw)]
+
+    def _split_masks(
+        self, N: int, scorable_idx: list[int], group_keys: list[str]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Create reproducible train/val/test masks over scorable nodes only,
+        grouped by containing file.
+
+        Git-mode labels are assigned per-file and then propagated to every
+        function/class in that file (see
+        ``GitMiner.file_labels_to_node_labels``). A naive random node-level
+        split would therefore routinely place same-file siblings — which
+        share an identical label — on both sides of train/test, leaking
+        label information and inflating held-out metrics. Splitting by
+        file group instead guarantees every node belonging to the same file
+        lands in exactly one of train/val/test.
+
+        Split fractions (``train_frac`` / ``val_frac``) are preserved
+        approximately: whole file-groups are assigned to a split in
+        seed-shuffled order until that split's target size is reached.
+
+        Small-repo guarantees
+        ---------------------
+        Because whole groups move together, a repo with few (or unevenly
+        sized) files can exhaust every group in train+val, leaving the test
+        split empty — which breaks evaluation downstream. So:
+
+        - With >= 3 groups, every split is guaranteed at least one group
+          (rebalanced after the greedy pass, test first since an empty test
+          split is the hardest failure).
+        - With 2 groups, train and test each get one (val stays empty —
+          early stopping degrades to "keep last epoch" but training and
+          evaluation still work).
+        - With 1 group, everything lands in train and a warning is logged;
+          there is no leakage-safe way to evaluate a single-file repo.
+        """
+        rng = np.random.default_rng(seed=42)
+
+        # Group scorable node indices by their containing file.
+        groups: dict[str, list[int]] = {}
+        for i in scorable_idx:
+            groups.setdefault(group_keys[i], []).append(i)
+
+        # Deterministic base order, then seeded shuffle of the groups
+        # themselves (not the individual nodes) so a whole file always
+        # moves together.
+        group_order = sorted(groups.keys())
+        perm = rng.permutation(len(group_order))
+        shuffled_keys = [group_order[p] for p in perm]
+
+        n_s = len(scorable_idx)
+        train_target = int(n_s * self.config.train_frac)
+        val_target = int(n_s * self.config.val_frac)
+
+        # Greedy pass: pack whole groups into train, then val, then test.
+        assigned: dict[str, list[list[int]]] = {"train": [], "val": [], "test": []}
+        counts = {"train": 0, "val": 0, "test": 0}
+        for key in shuffled_keys:
+            members = groups[key]
+            if counts["train"] < train_target:
+                split = "train"
+            elif counts["val"] < val_target:
+                split = "val"
+            else:
+                split = "test"
+            assigned[split].append(members)
+            counts[split] += len(members)
+
+        # Rebalance pass: guarantee val/test each hold at least one group
+        # whenever enough groups exist, donating from whichever other split
+        # currently holds the most groups (a donor must keep at least one
+        # group). Deterministic: donor choice depends only on group counts,
+        # ties broken by fixed split order; the moved group is always the
+        # donor's last-assigned one.
+        def _donate_to(dst: str) -> None:
+            if assigned[dst]:
+                return
+            donors = [
+                s for s in ("train", "val", "test")
+                if s != dst and len(assigned[s]) > 1
+            ]
+            if not donors:
+                return  # fewer groups than splits — degrade as documented
+            donor = max(donors, key=lambda s: len(assigned[s]))
+            moved = assigned[donor].pop()
+            assigned[dst].append(moved)
+            counts[donor] -= len(moved)
+            counts[dst] += len(moved)
+
+        _donate_to("test")
+        _donate_to("val")
+
+        # With exactly 2 groups the greedy pass put both in train; ensure
+        # test gets one even though the donor rule above requires len > 1.
+        if not assigned["test"] and len(assigned["train"]) == 2 and not assigned["val"]:
+            moved = assigned["train"].pop()
+            assigned["test"].append(moved)
+            counts["train"] -= len(moved)
+            counts["test"] += len(moved)
+
+        if not assigned["test"]:
+            logger.warning(
+                "File-grouped split: repo has too few files to populate a "
+                "test split (every node shares one file group). Metrics "
+                "cannot be computed without leakage; all nodes assigned to "
+                "train."
+            )
+        if not assigned["val"]:
+            logger.warning(
+                "File-grouped split: no file group available for the "
+                "validation split; early stopping will not trigger."
+            )
+
+        train_idx = [i for grp in assigned["train"] for i in grp]
+        val_idx = [i for grp in assigned["val"] for i in grp]
+        test_idx = [i for grp in assigned["test"] for i in grp]
 
         train_mask = torch.zeros(N, dtype=torch.bool)
         val_mask = torch.zeros(N, dtype=torch.bool)
         test_mask = torch.zeros(N, dtype=torch.bool)
 
-        train_mask[perm[:train_end].tolist()] = True
-        val_mask[perm[train_end:val_end].tolist()] = True
-        test_mask[perm[val_end:].tolist()] = True
+        if train_idx:
+            train_mask[train_idx] = True
+        if val_idx:
+            val_mask[val_idx] = True
+        if test_idx:
+            test_mask[test_idx] = True
 
         return train_mask, val_mask, test_mask
 

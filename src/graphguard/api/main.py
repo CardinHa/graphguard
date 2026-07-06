@@ -18,13 +18,19 @@ to scale horizontally.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from graphguard.utils.logging import get_logger
+from graphguard.utils.optional_deps import missing_dependency_message
+
+logger = get_logger(__name__)
 
 app = FastAPI(
     title="GraphGuard API",
@@ -32,16 +38,37 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Allow local dashboard / browser to call the API
+# CORS: restricted to localhost dev origins by default (the dashboard and a
+# local browser session are the only expected callers). Override with a
+# comma-separated GRAPHGUARD_CORS_ORIGINS env var for other deployments.
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost",
+    "http://localhost:8501",
+    "http://127.0.0.1",
+    "http://127.0.0.1:8501",
+]
+_cors_env = os.environ.get("GRAPHGUARD_CORS_ORIGINS")
+_cors_origins = (
+    [o.strip() for o in _cors_env.split(",") if o.strip()]
+    if _cors_env
+    else _DEFAULT_CORS_ORIGINS
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Default outputs directory — resolved relative to the running directory
 _DEFAULT_OUTPUT_DIR = Path("outputs")
+
+# Root directory that user-supplied repo_path/output_dir values must resolve
+# within. Without this, /analyze and friends would happily read/write any
+# path the caller names (e.g. "../../etc" or an absolute system path).
+# Defaults to the server's working directory; override with GRAPHGUARD_ROOT
+# for deployments that serve repos from elsewhere.
+_ALLOWED_ROOT = Path(os.environ.get("GRAPHGUARD_ROOT", Path.cwd())).resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -51,9 +78,9 @@ _DEFAULT_OUTPUT_DIR = Path("outputs")
 class AnalyzeRequest(BaseModel):
     repo_path: str
     output_dir: Optional[str] = None
-    label_mode: str = "synthetic"
-    model_type: str = "sage"
-    epochs: int = 200
+    label_mode: Literal["synthetic", "git"] = "synthetic"
+    model_type: Literal["sage", "gcn"] = "sage"
+    epochs: int = Field(default=200, ge=1, le=1000)
 
 
 class ExplainRequest(BaseModel):
@@ -61,7 +88,7 @@ class ExplainRequest(BaseModel):
     node: str
     output_dir: Optional[str] = None
     top_k: int = 5
-    explainer_epochs: int = 200
+    explainer_epochs: int = Field(default=200, ge=1, le=500)
 
 
 class HealthResponse(BaseModel):
@@ -73,8 +100,27 @@ class HealthResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _resolve_within_root(raw_path: str, field_name: str) -> Path:
+    """Resolve a user-supplied path and reject it (400) if it escapes
+    _ALLOWED_ROOT, e.g. via "../.." traversal or an absolute path elsewhere
+    on the filesystem."""
+    resolved = Path(raw_path).resolve()
+    if not resolved.is_relative_to(_ALLOWED_ROOT):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{field_name} must resolve within {_ALLOWED_ROOT} "
+                "(set the GRAPHGUARD_ROOT environment variable to allow a "
+                "different location)."
+            ),
+        )
+    return resolved
+
+
 def _output_dir(override: Optional[str] = None) -> Path:
-    return Path(override) if override else _DEFAULT_OUTPUT_DIR
+    if override:
+        return _resolve_within_root(override, "output_dir")
+    return _DEFAULT_OUTPUT_DIR
 
 
 def _require_file(path: Path) -> None:
@@ -103,10 +149,16 @@ def analyze(request: AnalyzeRequest) -> dict[str, Any]:
     This is a synchronous endpoint that runs the full pipeline inline.
     For large repositories, consider wrapping in a background task.
     """
-    from graphguard.models.train import run_full_pipeline
+    try:
+        from graphguard.models.train import run_full_pipeline
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=f"{missing_dependency_message('gnn', 'POST /analyze')} ({exc})",
+        )
     from graphguard.utils.config import Config, ModelConfig
 
-    repo = Path(request.repo_path)
+    repo = _resolve_within_root(request.repo_path, "repo_path")
     if not repo.exists():
         raise HTTPException(status_code=400, detail=f"Repository not found: {repo}")
 
@@ -122,8 +174,12 @@ def analyze(request: AnalyzeRequest) -> dict[str, Any]:
     try:
         summary = run_full_pipeline(repo, config=config, output_dir=out)
         return {"status": "ok", **summary}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception(f"analyze failed for repo_path={request.repo_path!r}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error while analyzing the repository. See server logs for details.",
+        )
 
 
 @app.get("/graph")
@@ -208,15 +264,21 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
       - Function or class name (e.g. "resolve_proxies")
       - Substring of a node_id (e.g. "utils.py")
     """
-    from graphguard.data.dataset import CodeGraphDataset
-    from graphguard.data.git_mining import GitMiner
+    try:
+        from graphguard.data.dataset import CodeGraphDataset
+        from graphguard.models.explain import explain_node, load_model
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=f"{missing_dependency_message('gnn', 'POST /explain')} ({exc})",
+        )
+    from graphguard.data.git_mining import GitLabelPathMismatchError, GitMiner
     from graphguard.graph.features import FeatureExtractor
     from graphguard.graph.graph_builder import GraphBuilder
-    from graphguard.models.explain import explain_node, load_model
     from graphguard.parser.python_parser import PythonParser
-    from graphguard.utils.config import Config
+    from graphguard.utils.config import Config, ModelConfig
 
-    repo = Path(request.repo_path)
+    repo = _resolve_within_root(request.repo_path, "repo_path")
     if not repo.exists():
         raise HTTPException(status_code=400, detail=f"Repository not found: {repo}")
 
@@ -230,7 +292,18 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
 
     meta_info = json.loads(meta_path.read_text(encoding="utf-8"))
     label_mode = meta_info.get("label_mode", "synthetic")
-    config = Config(label_mode=label_mode)
+    # Reuse the model hyperparameters persisted at train time so the
+    # reconstructed architecture matches the saved state_dict.
+    default_mc = ModelConfig()
+    config = Config(
+        label_mode=label_mode,
+        model=ModelConfig(
+            model_type=meta_info.get("model_type", default_mc.model_type),
+            hidden_dim=meta_info.get("hidden_dim", default_mc.hidden_dim),
+            num_layers=meta_info.get("num_layers", default_mc.num_layers),
+            dropout=meta_info.get("dropout", default_mc.dropout),
+        ),
+    )
 
     try:
         # Rebuild graph + dataset (no training — typically < 3s for small repos)
@@ -248,7 +321,11 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
             miner = GitMiner(repo)
             file_counts = miner.mine_bug_fix_labels()
             if file_counts:
-                labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+                try:
+                    labels = miner.file_labels_to_node_labels(file_counts, list(G.nodes()))
+                except GitLabelPathMismatchError as exc:
+                    logger.error(str(exc))
+                    labels = None
 
         dataset_builder = CodeGraphDataset(config)
         data, _ = dataset_builder.build(G, features_df, labels=labels, undirected=False)
@@ -273,5 +350,11 @@ def explain(request: ExplainRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception(
+            f"explain failed for repo_path={request.repo_path!r}, node={request.node!r}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error while explaining the node. See server logs for details.",
+        )

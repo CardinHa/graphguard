@@ -1,31 +1,34 @@
-# Core ML
-torch>=2.0.0
-torch-geometric>=2.3.0
+# Full dependency set for local development (core + all optional extras,
+# equivalent to `pip install -e ".[dev,gnn,serve,dash,git]"`).
+# See pyproject.toml [project.optional-dependencies] for how these split:
+# only networkx/pandas/numpy/scikit-learn/typer/rich/pydantic/scipy are
+# required for `graphguard analyze` — everything else is optional.
 
-# Graph
+# Core
 networkx>=3.1
 scipy>=1.11.0
-
-# Data
 pandas>=2.0.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
-gitpython>=3.1.0
-
-# CLI
 typer>=0.9.0
 rich>=13.0.0
-
-# API
-fastapi>=0.100.0
-uvicorn[standard]>=0.23.0
 pydantic>=2.0.0
 
-# Dashboard
+# GNN training/inference/explain (extra: gnn)
+torch>=2.0.0
+torch-geometric>=2.3.0
+
+# Git-history labeling (extra: git)
+gitpython>=3.1.0
+
+# API server (extra: serve)
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# Dashboard (extra: dash)
 streamlit>=1.25.0
 pyvis>=0.3.2
 plotly>=5.15.0
-matplotlib>=3.7.0
 
 # Dev
 pytest>=7.4.0

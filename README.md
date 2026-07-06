@@ -184,9 +184,15 @@ Sigmoid → risk probability per node
 
 Most code nodes are "safe." We weight the positive class inversely to its frequency using PyTorch's `BCEWithLogitsLoss(pos_weight=n_neg/n_pos)`.
 
-### Why GNNs outperform baselines here
+### Why GNNs could outperform baselines here — and what we actually measured
 
-A random forest on node features knows that *this function* is complex and central. A GNN also knows that *this function's callers* are complex and central. Structural risk propagates through neighborhoods — GNNs capture this; tabular models do not.
+The theoretical case: a random forest on node features knows that *this function* is complex and central. A GNN also knows that *this function's callers* are complex and central. Structural risk propagates through neighborhoods — GNNs can capture this in principle; tabular models cannot.
+
+In practice, on the `psf/requests` benchmark below (re-run under the fixed, leakage-free
+file-grouped split), this advantage did not show up: GraphSAGE's mean ROC-AUC across 3
+seeds was below chance and below both tabular baselines, with RandomForest the strongest
+performer. See "Model Results" for the honest numbers and the caveats around repo size and
+label skew that likely contributed.
 
 ---
 
@@ -435,42 +441,73 @@ pytest tests/test_parser.py -v
 
 ### Real-world validation: `psf/requests` (`--label-mode git`)
 
-> ⚠️ **Known issue — numbers below are pre-fix and will be re-run.** An audit found that
-> the train/val/test split in `CodeGraphDataset._split_masks` assigned nodes to splits
-> independently at random. Git-mode labels are file-level and are propagated to *every*
-> function/class in a file (see `GitMiner.file_labels_to_node_labels`), so same-file
-> siblings sharing an identical label could end up on both sides of train/test. That is
-> label leakage, and it inflates held-out metrics — most visibly the precision = 1.0000
-> and ROC-AUC = 0.9894 figures previously reported here.
->
-> The split has since been fixed to group by file (every node belonging to the same file
-> now lands in exactly one of train/val/test; see `dataset.py`), which removes this
-> leakage path. The benchmark below has **not yet been re-run** against the fixed split —
-> treat the table as a historical, pre-fix artifact rather than a current performance
-> claim. We are intentionally not inventing new numbers here; a corrected benchmark run
-> is tracked as follow-up work.
+> **Previously reported numbers on this benchmark were inflated by a split-leakage bug**
+> (`CodeGraphDataset._split_masks` assigned nodes to train/val/test independently at
+> random, so same-file siblings sharing an identical git-mined label could land on both
+> sides of the split — most visibly inflating precision to 1.0000 and ROC-AUC to 0.9894).
+> That bug was fixed in PR #1 (the split now groups every node by its containing file, so
+> a file lands entirely in one of train/val/test). The table below is the **re-run under
+> the fixed, file-grouped split** — this is the honest number, not the historical one.
 
-GraphGuard was run against the full [`requests`](https://github.com/psf/requests) source tree
-using 500 commits of git history for labeling (1,876 commits scanned, 124 files flagged via
-bug-fix keyword matching). All numbers below are on a held-out test split from the
-**pre-fix, leaky** random node-level split.
+**Setup.** Cloned [`psf/requests`](https://github.com/psf/requests) at commit
+[`4c800e9`](https://github.com/psf/requests/commit/4c800e9aea2059660b8306b0fc8f9e9a4232cb3e)
+(`main`, 2026-07-06). Ran `graphguard train <repo> --label-mode git --seed {42,43,44}` —
+the repo's own CLI, default hyperparameters (SAGE, 200 epochs / patience 20, hidden_dim 64,
+2 layers, dropout 0.3). `--seed` is a new CLI flag added for this benchmark rerun (see the
+separate reproducibility-fix commit); it seeds the file-grouped split shuffle, the
+LogReg/RandomForest `random_state`, and torch/numpy global RNG before GNN init/training,
+so each of the 3 runs below is an independent draw, not 3x the same split.
 
-**Graph:** 835 nodes · 1,872 edges · 753 scorable (files/functions/classes)
-(1,536 structural edges + **336 cross-file call edges** resolved via import tracking)
+**Deviation from the old methodology note:** the README previously described the label
+miner as using "500 commits of git history." The current `GitMiner.mine_bug_fix_labels`
+has no commit-window parameter — it always scans full history via `repo.iter_commits()`.
+There is no code path to reproduce a "500 commit" limit, so full history was mined as-is
+(6,482 commits scanned this run, 149 files flagged via bug-fix keyword matching — up from
+the previously reported 124, since more history means more files eventually touched by a
+fix commit). One consequence worth flagging: this makes the label highly prevalent —
+661 of 757 scorable nodes (87.3%) are labeled risky — because on a mature, actively
+maintained repo, nearly every live file eventually gets touched by *some* fix commit over
+its full lifetime. That skew, combined with `requests` having only 37 Python files (so the
+file-grouped splitter has few "groups" to allocate), is the main driver of the run-to-run
+variance below.
 
-| Model | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC |
-|-------|----------|-----------|--------|----|---------|--------|
-| **GraphSAGE** | 0.8421 | 1.0000 | 0.8302 | 0.9072 | 0.9894 | 0.9992 |
-| LogisticRegression | 0.7456 | 0.9753 | 0.7453 | 0.8449 | 0.7700 | 0.9760 |
-| RandomForest | 0.9386 | 0.9901 | 0.9434 | 0.9662 | 0.9723 | 0.9978 |
+**Graph:** 822 nodes · 1,297 edges · 757 scorable (files/functions/classes)
 
-*(pre-fix, to be re-run against the file-grouped split)*
+| Model | Seed | Accuracy | Precision | Recall | F1 | ROC-AUC | PR-AUC | Test size |
+|-------|------|----------|-----------|--------|----|---------|--------|-----------|
+| GraphSAGE | 42 | 0.7632 | 0.7632 | 1.0000 | 0.8657 | 0.1111 | 0.6174 | 38 |
+| GraphSAGE | 43 | 0.2162 | 1.0000 | 0.0440 | 0.0842 | 0.5154 | 0.8583 | 111 |
+| GraphSAGE | 44 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000† | 0.0000† | 37 |
+| **GraphSAGE (mean)** | — | **0.3265** | **0.5877** | **0.3480** | **0.3166** | **0.2088** | **0.4919** | — |
+| LogisticRegression | 42 | 0.2632 | 1.0000 | 0.0345 | 0.0667 | 0.8123 | 0.9365 | 38 |
+| LogisticRegression | 43 | 0.3694 | 0.7059 | 0.3956 | 0.5070 | 0.4423 | 0.8327 | 111 |
+| LogisticRegression | 44 | 0.5676 | 1.0000 | 0.5676 | 0.7241 | 0.0000† | 0.0000† | 37 |
+| **LogisticRegression (mean)** | — | **0.4001** | **0.9020** | **0.3326** | **0.4326** | **0.4182** | **0.5897** | — |
+| RandomForest | 42 | 0.7632 | 0.7778 | 0.9655 | 0.8615 | 0.8621 | 0.9559 | 38 |
+| RandomForest | 43 | 0.4144 | 0.7167 | 0.4725 | 0.5695 | 0.3679 | 0.8100 | 111 |
+| RandomForest | 44 | 0.6757 | 1.0000 | 0.6757 | 0.8065 | 0.0000† | 0.0000† | 37 |
+| **RandomForest (mean)** | — | **0.6178** | **0.8315** | **0.7046** | **0.7458** | **0.4100** | **0.5886** | — |
 
-**Top flagged nodes (GNN risk score > 0.99):** all functions in `utils.py` —
-`get_proxy`, `resolve_proxies`, `requote_uri`, `super_len`, and 15 more.
-`utils.py` is the most-edited file in the `requests` history and has the highest fan-in
-of any module, so this direction of the signal is plausible — but the exact magnitude of
-the numbers above should not be trusted until the benchmark is re-run post-fix.
+† Seed 44's test split (37 nodes) happened to contain only the "risky" class (single-class
+test set), so ROC-AUC/PR-AUC are undefined and reported as 0.0 by `evaluate.py`'s
+convention rather than reflecting genuinely poor ranking. This is a real artifact of the
+file-grouped split on a 37-file repo, not a scoring bug — and it's exactly the "small test
+splits make point metrics noisy" failure mode already called out in Limitations below.
+
+**Honest finding: GraphSAGE does not beat the tabular baselines here.** Averaged over 3
+seeds, GraphSAGE's ROC-AUC (0.2088) is well below chance (0.5) and below both
+LogisticRegression (0.4182) and RandomForest (0.4100) — RandomForest is the strongest and
+most stable of the three across seeds. This directly contradicts the "GNNs outperform
+baselines here" narrative in the pre-fix table, and we are not spinning it: under a
+leakage-free, file-grouped split, on this repo, with this label source, structural
+message-passing did not add measurable value over handcrafted per-node features. Plausible
+contributing factors (not excuses): a 37-file repo gives the splitter very few groups to
+work with, producing high-variance, occasionally single-class test sets; the label is
+90%-skewed positive after mining full git history, which starves the GNN's minority class
+in an already-small graph; and no hyperparameter search was done for the GNN specifically
+(baselines and GNN both used their out-of-the-box defaults). Whether a larger repo, a
+class-balanced label source, or GNN-specific tuning would change this conclusion is open
+follow-up work — we deliberately did not tune until the GNN won.
 
 ---
 
@@ -565,7 +602,7 @@ The same mathematical primitives — adjacency matrices, graph traversal, eigenv
 
 - **Trained a GraphSAGE Graph Neural Network** with PyTorch Geometric to predict structurally risky code components using node centrality, fan-in/fan-out, dependency depth, cyclomatic complexity, and learned multi-hop neighborhood embeddings.
 
-- **Implemented and benchmarked ML models** — GraphSAGE, GCN, Logistic Regression, and Random Forest — evaluating performance on precision, recall, F1, ROC-AUC, and PR-AUC; demonstrated that relational graph features improve risk prediction over handcrafted features alone.
+- **Implemented and benchmarked ML models** — GraphSAGE, GCN, Logistic Regression, and Random Forest — evaluating performance on precision, recall, F1, ROC-AUC, and PR-AUC under a leakage-free, file-grouped train/test split; found that on the `psf/requests` real-world benchmark, relational message passing did **not** outperform handcrafted tabular features, and documented that honest (rather than favorable) result.
 
 - **Added GNNExplainer interpretability** to surface which input features and graph neighbors drive each risk prediction, converting raw scores into actionable developer explanations via per-node mask optimisation.
 
@@ -605,7 +642,7 @@ The same mathematical primitives — adjacency matrices, graph traversal, eigenv
 
 ### What happens when you run on a real codebase?
 
-"On `psf/requests` with 500 commits of git history, the pre-fix run showed the GNN at ROC-AUC 0.9894 vs LogReg's 0.7700 — a +18.94 point gap. **Update: that split had a file-level label-leakage bug** (see 'Model Results' above), so those exact numbers are being re-run and shouldn't be quoted as current. The mechanism story still holds directionally: the key factor is cross-file call resolution — GraphGuard tracks imports across file boundaries, so when `adapters.py` calls `get_encoding_from_headers` in `utils.py`, that edge exists in the graph, and GraphSAGE propagates risk through those edges while LogReg has no access to that topology at all. PageRank also became the #1 predictor (44%) over complexity (49% on synthetic labels) in the pre-fix run — a signal the tabular models can compute but can't use relationally."
+"On `psf/requests`, under the corrected file-grouped split (3 seeds, git-mined labels), GraphSAGE does **not** beat the tabular baselines — its mean ROC-AUC (0.2088) is below chance and below both LogisticRegression (0.4182) and RandomForest (0.4100), which was the most stable performer. That's the honest result, and it directly reverses the pre-fix number (ROC-AUC 0.9894), which turned out to be a split-leakage artifact, not a real GNN advantage. I'm not spinning this: on this repo, with this label source, out-of-the-box hyperparameters, cross-file message passing didn't add measurable value over handcrafted per-node features like PageRank and complexity. A 37-file repo gives the file-grouped splitter very little to work with — test sets ranged from 37 to 111 nodes and one seed produced a single-class test split — so this reads as much as 'the benchmark repo and label source are small and skewed' as it does 'the GNN underperformed.' The honest takeaway is that the earlier 'GNNs win here' claim wasn't supported once the leakage was removed, and I'd want a bigger, more balanced benchmark (and some GNN-specific tuning) before claiming otherwise either way."
 
 ### How does GNNExplainer work?
 

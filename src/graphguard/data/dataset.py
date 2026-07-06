@@ -324,7 +324,7 @@ class CodeGraphDataset:
         - With 1 group, everything lands in train and a warning is logged;
           there is no leakage-safe way to evaluate a single-file repo.
         """
-        rng = np.random.default_rng(seed=42)
+        rng = np.random.default_rng(seed=self.config.seed)
 
         # Group scorable node indices by their containing file.
         groups: dict[str, list[int]] = {}

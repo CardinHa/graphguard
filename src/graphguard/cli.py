@@ -121,6 +121,12 @@ def train(
     hidden_dim: int = typer.Option(64, "--hidden-dim"),
     layers: int = typer.Option(2, "--layers"),
     dropout: float = typer.Option(0.3, "--dropout"),
+    seed: int = typer.Option(
+        42, "--seed",
+        help="Random seed for the file-grouped split shuffle, baseline "
+             "classifiers, and GNN weight init/training (for seed-averaged "
+             "benchmark runs).",
+    ),
 ) -> None:
     """[cyan]Full training pipeline: parse -> graph -> GNN -> baselines -> report.[/]"""
     try:
@@ -139,6 +145,7 @@ def train(
 
     config = Config(
         label_mode=label_mode,
+        seed=seed,
         model=ModelConfig(
             model_type=model_type,
             epochs=epochs,

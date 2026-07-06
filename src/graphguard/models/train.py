@@ -95,6 +95,13 @@ def train_gnn(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Seed torch/numpy global RNG state so weight init, dropout masks, and
+    # any other stochastic ops are reproducible for a given config.seed.
+    # This does NOT affect the train/val/test split, which is seeded
+    # separately (and deterministically) in CodeGraphDataset._split_masks.
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+
     data = data.to(device)
 
     # Class imbalance: weight positive class inversely proportional to its frequency
@@ -263,7 +270,7 @@ def run_full_pipeline(
     X_test = X[data.test_mask.cpu().numpy()]
     y_test = y_all[data.test_mask.cpu().numpy()]
 
-    baselines = BaselineModels()
+    baselines = BaselineModels(random_state=config.seed)
     baseline_results = baselines.fit_predict(X_train, y_train, X_test, y_test)
     baseline_metrics = [
         compute_metrics(br.model_name, br.y_true, br.y_pred, br.y_prob)

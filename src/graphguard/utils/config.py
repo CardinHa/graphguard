@@ -57,6 +57,12 @@ class Config:
     val_frac: float = 0.15
     # test_frac is inferred as 1 - train - val
 
+    # Reproducibility: seeds the file-grouped split shuffle, the baseline
+    # classifiers (LogReg/RandomForest random_state), and torch/numpy global
+    # RNG state before GNN init + training. Change this to get an
+    # independent run for seed-averaging benchmarks.
+    seed: int = 42
+
     # Model
     model: ModelConfig = field(default_factory=ModelConfig)
 

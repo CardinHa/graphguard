@@ -308,6 +308,21 @@ class CodeGraphDataset:
         Split fractions (``train_frac`` / ``val_frac``) are preserved
         approximately: whole file-groups are assigned to a split in
         seed-shuffled order until that split's target size is reached.
+
+        Small-repo guarantees
+        ---------------------
+        Because whole groups move together, a repo with few (or unevenly
+        sized) files can exhaust every group in train+val, leaving the test
+        split empty — which breaks evaluation downstream. So:
+
+        - With >= 3 groups, every split is guaranteed at least one group
+          (rebalanced after the greedy pass, test first since an empty test
+          split is the hardest failure).
+        - With 2 groups, train and test each get one (val stays empty —
+          early stopping degrades to "keep last epoch" but training and
+          evaluation still work).
+        - With 1 group, everything lands in train and a warning is logged;
+          there is no leakage-safe way to evaluate a single-file repo.
         """
         rng = np.random.default_rng(seed=42)
 
@@ -327,18 +342,68 @@ class CodeGraphDataset:
         train_target = int(n_s * self.config.train_frac)
         val_target = int(n_s * self.config.val_frac)
 
-        train_idx: list[int] = []
-        val_idx: list[int] = []
-        test_idx: list[int] = []
-
+        # Greedy pass: pack whole groups into train, then val, then test.
+        assigned: dict[str, list[list[int]]] = {"train": [], "val": [], "test": []}
+        counts = {"train": 0, "val": 0, "test": 0}
         for key in shuffled_keys:
             members = groups[key]
-            if len(train_idx) < train_target:
-                train_idx.extend(members)
-            elif len(val_idx) < val_target:
-                val_idx.extend(members)
+            if counts["train"] < train_target:
+                split = "train"
+            elif counts["val"] < val_target:
+                split = "val"
             else:
-                test_idx.extend(members)
+                split = "test"
+            assigned[split].append(members)
+            counts[split] += len(members)
+
+        # Rebalance pass: guarantee val/test each hold at least one group
+        # whenever enough groups exist, donating from whichever other split
+        # currently holds the most groups (a donor must keep at least one
+        # group). Deterministic: donor choice depends only on group counts,
+        # ties broken by fixed split order; the moved group is always the
+        # donor's last-assigned one.
+        def _donate_to(dst: str) -> None:
+            if assigned[dst]:
+                return
+            donors = [
+                s for s in ("train", "val", "test")
+                if s != dst and len(assigned[s]) > 1
+            ]
+            if not donors:
+                return  # fewer groups than splits — degrade as documented
+            donor = max(donors, key=lambda s: len(assigned[s]))
+            moved = assigned[donor].pop()
+            assigned[dst].append(moved)
+            counts[donor] -= len(moved)
+            counts[dst] += len(moved)
+
+        _donate_to("test")
+        _donate_to("val")
+
+        # With exactly 2 groups the greedy pass put both in train; ensure
+        # test gets one even though the donor rule above requires len > 1.
+        if not assigned["test"] and len(assigned["train"]) == 2 and not assigned["val"]:
+            moved = assigned["train"].pop()
+            assigned["test"].append(moved)
+            counts["train"] -= len(moved)
+            counts["test"] += len(moved)
+
+        if not assigned["test"]:
+            logger.warning(
+                "File-grouped split: repo has too few files to populate a "
+                "test split (every node shares one file group). Metrics "
+                "cannot be computed without leakage; all nodes assigned to "
+                "train."
+            )
+        if not assigned["val"]:
+            logger.warning(
+                "File-grouped split: no file group available for the "
+                "validation split; early stopping will not trigger."
+            )
+
+        train_idx = [i for grp in assigned["train"] for i in grp]
+        val_idx = [i for grp in assigned["val"] for i in grp]
+        test_idx = [i for grp in assigned["test"] for i in grp]
 
         train_mask = torch.zeros(N, dtype=torch.bool)
         val_mask = torch.zeros(N, dtype=torch.bool)

@@ -120,11 +120,25 @@ def train_gnn(
     best_state = None
     patience_counter = 0
 
+    # Very small repos may leave the validation split empty (see
+    # CodeGraphDataset._split_masks). Track training loss for early
+    # stopping/checkpointing in that case so training still completes
+    # instead of comparing against a NaN loss forever.
+    has_val = bool(data.val_mask.sum().item() > 0)
+    if not has_val:
+        logger.warning(
+            "Validation split is empty — early stopping/checkpointing will "
+            "track training loss instead of validation loss."
+        )
+
     console.print(f"[bold cyan]Training {mc.model_type.upper()} on {device}...[/]")
 
     for epoch in range(1, mc.epochs + 1):
         train_loss = _train_epoch(model, data, optimizer, criterion)
-        val_loss, _, _ = _evaluate_split(model, data, data.val_mask, criterion)
+        if has_val:
+            val_loss, _, _ = _evaluate_split(model, data, data.val_mask, criterion)
+        else:
+            val_loss = train_loss
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss

@@ -156,6 +156,68 @@ class TestFileGroupedSplit:
         assert meta.train_size / n_scorable == pytest.approx(0.70, abs=0.15)
         assert meta.val_size / n_scorable == pytest.approx(0.15, abs=0.1)
 
+    def test_small_repo_all_splits_nonempty(self, builder: CodeGraphDataset) -> None:
+        """Regression test for the empty-test-split crash: a repo with only
+        a handful of unevenly sized files (like examples/sample_project)
+        must still populate train, val, AND test — greedy group packing
+        alone could exhaust every group in train+val, and empty test masks
+        crashed sklearn metrics downstream."""
+        # 5 uneven files mirroring the sample project's shape
+        # (group sizes 20, 14, 8, 8, 7 including the file node itself)
+        sizes = [19, 13, 7, 7, 6]
+        entities = []
+        rels = []
+        for i, n_funcs in enumerate(sizes):
+            fp = f"pkg/file_{i}.py"
+            file_id = f"file::{fp}"
+            entities.append(ParsedEntity(file_id, f"file_{i}.py", "file", fp, 1))
+            for j in range(n_funcs):
+                fid = f"func::{fp}::fn_{j}"
+                entities.append(ParsedEntity(fid, f"fn_{j}", "function", fp, 2 + j))
+                rels.append(ParsedRelationship(file_id, fid, "contains", fp))
+        G = GraphBuilder().build(ParseResult(entities=entities, relationships=rels))
+        df = FeatureExtractor().extract(G)
+        data, meta = builder.build(G, df)
+
+        assert meta.train_size > 0
+        assert meta.val_size > 0
+        assert meta.test_size > 0
+
+    def test_two_file_repo_gets_train_and_test(self, builder: CodeGraphDataset) -> None:
+        """With only 2 file groups, train and test each get one; val may be
+        empty (documented degradation) but evaluation must stay possible."""
+        G = _toy_graph_many_files(num_files=2, funcs_per_file=3)
+        df = FeatureExtractor().extract(G)
+        data, meta = builder.build(G, df)
+
+        assert meta.train_size > 0
+        assert meta.test_size > 0
+
+    def test_single_file_repo_does_not_crash(self, builder: CodeGraphDataset) -> None:
+        """A single-file repo has no leakage-safe way to build an eval
+        split; everything goes to train (with a warning) and nothing
+        crashes."""
+        G = _toy_graph_many_files(num_files=1, funcs_per_file=4)
+        df = FeatureExtractor().extract(G)
+        data, meta = builder.build(G, df)
+
+        assert meta.train_size > 0
+        assert meta.val_size == 0
+        assert meta.test_size == 0
+
+
+class TestEmptySplitMetrics:
+    def test_compute_metrics_tolerates_empty_split(self) -> None:
+        """compute_metrics on an empty split warns and returns zeros
+        instead of crashing with sklearn's empty-input ValueError."""
+        import numpy as np
+
+        from graphguard.models.evaluate import compute_metrics
+
+        m = compute_metrics("TEST", np.array([]), np.array([]), np.array([]))
+        assert m.accuracy == 0.0
+        assert m.roc_auc == 0.0
+
 
 class TestModelConfigPersistence:
     """dataset_meta.json must carry the model hyperparameters used for a
